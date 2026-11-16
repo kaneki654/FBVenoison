@@ -1,0 +1,56 @@
+# Python and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Generated builds, packaged binaries and archives
+build/
+dist/
+release/
+platform-tools/
+*.exe
+*.dll
+*.pyd
+*.so
+*.pkg
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.pyz
+*.toc
+
+# Private app settings and device state
+/boxes*.json
+**/venom_ai.json
+**/venom_accounts.json
+**/venom_workspaces.json
+**/venom_update.json
+**/poison_private.json
+**/ui_geometry.json
+**/learned_rows.json
+/FBPoison/update_config.json
+/update_config.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local captures, logs, previous source copies and generated update payloads
+.backups/
+debug/
+screenshots/
+artifacts/
+src_archive/
+/FBPoison/update_site/
+*.log
+*.log.*
+*build_log.txt
+*.bak
+*.bak*
+*.before-*
+*~

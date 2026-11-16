@@ -1,0 +1,266 @@
+{
+  "source": "/home/kaneki/FBVenom",
+  "destination": "/home/kaneki/FBVenoison/FBVenoison/FBVenom",
+  "source_commit": "ad9aca2683d0dad3b3023b7aa7409132d62b9706",
+  "version": "1.1.1",
+  "backup": "/home/kaneki/FBVenoison/FBVenoison/.backups/FBVenom-before-import-20261116-054714",
+  "preserved_local_state": [
+    "venom_ai.json",
+    "venom_accounts.json",
+    "venom_workspaces.json",
+    "venom_update.json"
+  ],
+  "files": [
+    {
+      "path": ".github/workflows/build-windows.yml",
+      "sha256": "14b7adb14654e1e4476fceca5e1638cc967edc3b7e1b725e4a9a7cf1e0efc664",
+      "changed": true,
+      "integrated_sha256": "a91a3f33a0f20bac984654093df1403143221b88e2ed397a361e7e3e74f5c356"
+    },
+    {
+      "path": ".gitignore",
+      "sha256": "32b2849dce39cdc8b1815032b2fecafdb9f2ec173dae617ade3352a2fc6c2163",
+      "changed": true,
+      "integrated_sha256": "32b2849dce39cdc8b1815032b2fecafdb9f2ec173dae617ade3352a2fc6c2163"
+    },
+    {
+      "path": "FBVenom.spec",
+      "sha256": "4c6ac288c21376474c647d4ccd037e29836fc53bb7d8baac65a2555143c60ef6",
+      "changed": true,
+      "integrated_sha256": "4aad097889bbca7035a067131d64447f3da83d424264e53752dc1898050c70a2"
+    },
+    {
+      "path": "README.md",
+      "sha256": "a3baa08f506b968ab7358a2e76117ec62d5237e3c8f42cbabb0035a27e538a71",
+      "changed": true,
+      "integrated_sha256": "a3baa08f506b968ab7358a2e76117ec62d5237e3c8f42cbabb0035a27e538a71"
+    },
+    {
+      "path": "aiconfig.py",
+      "sha256": "968ad9bcd6dec60606c1841d32587aaeffff6ff207db5c1e14a9a2f175f88a25",
+      "changed": true,
+      "integrated_sha256": "968ad9bcd6dec60606c1841d32587aaeffff6ff207db5c1e14a9a2f175f88a25"
+    },
+    {
+      "path": "assets/branding/SOURCES.md",
+      "sha256": "599ab3b8387827f82abafa7f877ab77ac812838f816fab29fbbcf42b0d1e0d91",
+      "changed": false,
+      "integrated_sha256": "599ab3b8387827f82abafa7f877ab77ac812838f816fab29fbbcf42b0d1e0d91"
+    },
+    {
+      "path": "assets/branding/facebook.svg",
+      "sha256": "82bc3244a4458deb1fe7b096b0dc65c7f1f6a0d5627a1733a0fdcc9430612d46",
+      "changed": false,
+      "integrated_sha256": "82bc3244a4458deb1fe7b096b0dc65c7f1f6a0d5627a1733a0fdcc9430612d46"
+    },
+    {
+      "path": "assets/branding/venom-head.png",
+      "sha256": "3a3eb468f5f5a03f8946d72206989613e7e93e79fac415140ca3bf268d6d1f94",
+      "changed": false,
+      "integrated_sha256": "3a3eb468f5f5a03f8946d72206989613e7e93e79fac415140ca3bf268d6d1f94"
+    },
+    {
+      "path": "auth.py",
+      "sha256": "c0785e8bba1acefb9c4660583567030eb0efb62cf868d88956c22276be0524c2",
+      "changed": false,
+      "integrated_sha256": "c0785e8bba1acefb9c4660583567030eb0efb62cf868d88956c22276be0524c2"
+    },
+    {
+      "path": "core.py",
+      "sha256": "1850dc09409d6e292613df79c7f1a9f4b2343e76d86c4f4485acdabda445ee67",
+      "changed": true,
+      "integrated_sha256": "1850dc09409d6e292613df79c7f1a9f4b2343e76d86c4f4485acdabda445ee67"
+    },
+    {
+      "path": "dist/FBVenom.build.json",
+      "sha256": "e8f4f9ae111599b1896d67e537291343711ffac229d7bb495769b2469a97a171",
+      "changed": true,
+      "integrated_sha256": "e8f4f9ae111599b1896d67e537291343711ffac229d7bb495769b2469a97a171"
+    },
+    {
+      "path": "dist/FBVenom.exe",
+      "sha256": "af34effdae379cf3c1e3859da93004c7a61db6ae325444d0236b5a175d8bb50d",
+      "changed": true,
+      "integrated_sha256": "af34effdae379cf3c1e3859da93004c7a61db6ae325444d0236b5a175d8bb50d"
+    },
+    {
+      "path": "dist/FBVenom.sha256",
+      "sha256": "ddf474b7f5cc49c118cd7ffea2ebc33ee47ffa4efe23be53923ce110a51e0546",
+      "changed": true,
+      "integrated_sha256": "ddf474b7f5cc49c118cd7ffea2ebc33ee47ffa4efe23be53923ce110a51e0546"
+    },
+    {
+      "path": "dist/manifest.json",
+      "sha256": "2b6b9ed4d3a847c547d78a51be693b08439d72ad859f194ba48bc1079d255a47",
+      "changed": true,
+      "integrated_sha256": "2b6b9ed4d3a847c547d78a51be693b08439d72ad859f194ba48bc1079d255a47"
+    },
+    {
+      "path": "fbvenom.py",
+      "sha256": "b6a7f2b44d4bf99ef485f6f11a6eda6f29d2291cca185eaf984225360ceb5451",
+      "changed": true,
+      "integrated_sha256": "86536fef05f9464f2c6472c2d2904d2a7dd586faf45a9e333ff1a303dfdcef83"
+    },
+    {
+      "path": "gui.py",
+      "sha256": "eb062487997dfb59a973e810beb7462cac25992e23206c431275fcc58278fc45",
+      "changed": true,
+      "integrated_sha256": "eb062487997dfb59a973e810beb7462cac25992e23206c431275fcc58278fc45"
+    },
+    {
+      "path": "icon.ico",
+      "sha256": "cbd41191b2cfa795e173fa0b400054dddaa30c60c011a84d75b6f3e91a9eb3b8",
+      "changed": false,
+      "integrated_sha256": "cbd41191b2cfa795e173fa0b400054dddaa30c60c011a84d75b6f3e91a9eb3b8"
+    },
+    {
+      "path": "icon.png",
+      "sha256": "b32f68e34cd3aaa540a798ef2a3b75d728b2128d6d867dc9e06d689343b2196c",
+      "changed": false,
+      "integrated_sha256": "b32f68e34cd3aaa540a798ef2a3b75d728b2128d6d867dc9e06d689343b2196c"
+    },
+    {
+      "path": "icon.svg",
+      "sha256": "e73d05cbaff2c6b379670a26e3f525728a4d32750a52b3123354bbe712b35a6d",
+      "changed": false,
+      "integrated_sha256": "e73d05cbaff2c6b379670a26e3f525728a4d32750a52b3123354bbe712b35a6d"
+    },
+    {
+      "path": "icon_nobg.png",
+      "sha256": "0011d7e5892482c1779b984fbeefc3c768e19cc861876293e1605fdce915f37a",
+      "changed": false,
+      "integrated_sha256": "0011d7e5892482c1779b984fbeefc3c768e19cc861876293e1605fdce915f37a"
+    },
+    {
+      "path": "requirements-build.txt",
+      "sha256": "354efabd57cedab1e79453c3f75c3f48c2f6a5b67467622980db8e9398e7f64a",
+      "changed": true,
+      "integrated_sha256": "354efabd57cedab1e79453c3f75c3f48c2f6a5b67467622980db8e9398e7f64a"
+    },
+    {
+      "path": "test_build_check.py",
+      "sha256": "ef550ecb146f2ad71d8cf02972920707fe321ff7dd88582da27bb206d1eaf29e",
+      "changed": true,
+      "integrated_sha256": "ef550ecb146f2ad71d8cf02972920707fe321ff7dd88582da27bb206d1eaf29e"
+    },
+    {
+      "path": "test_build_spec.py",
+      "sha256": "ff9ac8c428190a3883eb7f57b7d480475d549a04ba32ff2520866de7113fb44a",
+      "changed": true,
+      "integrated_sha256": "89b3bfccec98398c42e9471ac618b444056c405f1d423cc6c008fe153c98d7ef"
+    },
+    {
+      "path": "test_comment_diagnostics.py",
+      "sha256": "0509d0791a93324f68f328dc61867b35a522aea936aee7038356d393a27481c5",
+      "changed": true,
+      "integrated_sha256": "0509d0791a93324f68f328dc61867b35a522aea936aee7038356d393a27481c5"
+    },
+    {
+      "path": "test_comment_variety.py",
+      "sha256": "bf0eb4d60939e0ff2301e624b609d112a4222414509c9440d5e6192e42641663",
+      "changed": true,
+      "integrated_sha256": "bf0eb4d60939e0ff2301e624b609d112a4222414509c9440d5e6192e42641663"
+    },
+    {
+      "path": "test_diagnostics.py",
+      "sha256": "878cfbe54aadc98af95216866b085418127fc3ba912b15273836e96414fa22b1",
+      "changed": true,
+      "integrated_sha256": "878cfbe54aadc98af95216866b085418127fc3ba912b15273836e96414fa22b1"
+    },
+    {
+      "path": "test_gui_diagnostics.py",
+      "sha256": "0b813dd7709b02a4d5d831c8326329c87988897de949055d029fdd5db7a29534",
+      "changed": true,
+      "integrated_sha256": "0b813dd7709b02a4d5d831c8326329c87988897de949055d029fdd5db7a29534"
+    },
+    {
+      "path": "test_gui_workspaces.py",
+      "sha256": "dd11bb177ffd2592e3b16614b49cea1ee16e1a373ef25edd479cb9b3ba5a7ba0",
+      "changed": false,
+      "integrated_sha256": "dd11bb177ffd2592e3b16614b49cea1ee16e1a373ef25edd479cb9b3ba5a7ba0"
+    },
+    {
+      "path": "test_live_counting.py",
+      "sha256": "5b9840eafe350deb9b43cde1ecd9122e3044a09218a958ecea82240c23422760",
+      "changed": false,
+      "integrated_sha256": "5b9840eafe350deb9b43cde1ecd9122e3044a09218a958ecea82240c23422760"
+    },
+    {
+      "path": "test_updater.py",
+      "sha256": "3efedccb762c3442029900ebf6bde1f1e34a77ff49facd89b645547968e01fa2",
+      "changed": true,
+      "integrated_sha256": "3efedccb762c3442029900ebf6bde1f1e34a77ff49facd89b645547968e01fa2"
+    },
+    {
+      "path": "test_urls.py",
+      "sha256": "48b9ecae22a6fa6f31e357bf991b2b36e8a379c5734195120a940a8f8a2b15d6",
+      "changed": true,
+      "integrated_sha256": "48b9ecae22a6fa6f31e357bf991b2b36e8a379c5734195120a940a8f8a2b15d6"
+    },
+    {
+      "path": "test_windows_build_validation.py",
+      "sha256": "07d99b752161d5ceaa028120aec06444686bd69d3e2ecf52d380cabcecc939b5",
+      "changed": true,
+      "integrated_sha256": "07d99b752161d5ceaa028120aec06444686bd69d3e2ecf52d380cabcecc939b5"
+    },
+    {
+      "path": "test_workspaces.py",
+      "sha256": "b34eaf57cfe51e501577701f09ea45b75a0bffe0d07f801639d61279c8e14cd0",
+      "changed": false,
+      "integrated_sha256": "b34eaf57cfe51e501577701f09ea45b75a0bffe0d07f801639d61279c8e14cd0"
+    },
+    {
+      "path": "tools_publish_update.py",
+      "sha256": "43b5a4abd3464dab145c8dd21c49e3c7fa2b77a28b3ea7d8cbd6acd6867514ef",
+      "changed": true,
+      "integrated_sha256": "43b5a4abd3464dab145c8dd21c49e3c7fa2b77a28b3ea7d8cbd6acd6867514ef"
+    },
+    {
+      "path": "tools_strip_icon_bg.py",
+      "sha256": "2d83f07aa903ea6e5f9c7ee1aa4ea73d7c4bdbc7d222176cc70c47264dbe0e3c",
+      "changed": false,
+      "integrated_sha256": "2d83f07aa903ea6e5f9c7ee1aa4ea73d7c4bdbc7d222176cc70c47264dbe0e3c"
+    },
+    {
+      "path": "tools_validate_windows_build.py",
+      "sha256": "3da871e7d86e99e5e687c1826dc1e2736a9c165ca79360829b18c87ad48c1c05",
+      "changed": true,
+      "integrated_sha256": "3da871e7d86e99e5e687c1826dc1e2736a9c165ca79360829b18c87ad48c1c05"
+    },
+    {
+      "path": "updater.py",
+      "sha256": "b2c041d08710f89d25b023074d1b4e99a13f514d0c3ab1caac800bc536aebeab",
+      "changed": true,
+      "integrated_sha256": "256b78d9d84ca74f5d4d6ea18f78c6ff6ee65252d56f404b1e0147a9f312a31f"
+    },
+    {
+      "path": "venom_ai.example.json",
+      "sha256": "f48877f7ae01cf089ca858a019f1c961db91153686be193cadedb5858e091bf8",
+      "changed": true,
+      "integrated_sha256": "f48877f7ae01cf089ca858a019f1c961db91153686be193cadedb5858e091bf8"
+    },
+    {
+      "path": "version.py",
+      "sha256": "5e514eb6f47572a1e19a7a8856ced1568eeba8b9025717f6656376ddb8cb4820",
+      "changed": true,
+      "integrated_sha256": "5e514eb6f47572a1e19a7a8856ced1568eeba8b9025717f6656376ddb8cb4820"
+    },
+    {
+      "path": "workspaces.py",
+      "sha256": "5ff8ddc74136d62bf756bb991bbf4f3fd95263698ec53e005b1bea5f1d70b03d",
+      "changed": false,
+      "integrated_sha256": "5ff8ddc74136d62bf756bb991bbf4f3fd95263698ec53e005b1bea5f1d70b03d"
+    }
+  ],
+  "integration_changes": [
+    ".github/workflows/build-windows.yml",
+    "FBVenom.spec",
+    "fbvenom.py",
+    "test_build_spec.py",
+    "updater.py"
+  ],
+  "integration_additions": [
+    "suite_bridge.py"
+  ],
+  "verified_at": "2026-11-16T05:51:12.560825+00:00"
+}

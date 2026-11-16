@@ -1,0 +1,32 @@
+# Python environments and generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Build intermediates stay local; the verified Windows bundle is versioned.
+/build/
+/platform-tools/
+/dist/*
+!/dist/FBVenom.exe
+!/dist/FBVenom.sha256
+!/dist/FBVenom.build.json
+!/dist/manifest.json
+
+# Private settings and runtime data
+/venom_ai.json
+/venom_workspaces.json
+/venom_accounts.json
+/screenshots/
+/debug/
+*.log
+*.log.*
+.env
+.env.*
+!.env.example
+
+# Local editor and source backups
+*.bak
+*.bak.*
+*~
