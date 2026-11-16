@@ -20,6 +20,8 @@ for _stream in (sys.stdout, sys.stderr):
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TESTS = [
+    ("PowerShell rebuild and registration workflow", "test_rebuild_script.py"),
+    ("rebuilt app launch integration", "test_rebuild_launch.py"),
     ("local credential settings", "test_private_settings.py"),
     ("isolated demo entry and controls", "test_demo.py"),
     ("requested device capacities", "test_allocation.py"),

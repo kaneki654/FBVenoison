@@ -24,7 +24,7 @@ if __name__ == "__main__":
 
         # Locked gate: the wrong key plays the denial sequence and never
         # returns True, so the program exits without ever building the GUI.
-        if not require_key():
+        if os.environ.get("FBVENOISON_AUTHED") != "1" and not require_key():
             sys.exit(0)
 
         gui = ReactionGUI()

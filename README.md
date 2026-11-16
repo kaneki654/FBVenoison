@@ -120,31 +120,63 @@ The feed URL persists in `update_config.json`. See
 `FBVENOISON_UPDATE_URL` sets the initial feed; `FBVENOISON_UPDATE_DIR` changes
 the updater's settings/download location.
 
-## Windows releases
+## Rebuild and register on Windows
 
-The hub EXE in this folder predates these interface changes. The upstream
-FBVenom 1.1.1 EXE was also copied from `/home/kaneki/FBVenom/dist/`, but it does
-not implement the hub's assigned-device protocol. Source launches use the
-integrated new version now. Rebuild on Windows to use it through a frozen hub
-with the device split enforced. From the project
-folder, with dependencies, PyInstaller, and Android platform-tools installed:
+Run this in PowerShell with 64-bit Windows Python installed (Python 3.12 is
+supported by the bundled build requirements):
 
 ```powershell
-.\build_windows.ps1
+.\rebuild_windows.ps1 -Launch
 ```
 
-Set `FBVENOM_PLATFORM_TOOLS` to Google's extracted Windows platform-tools
-directory, or install them under `$env:LOCALAPPDATA\Android\platform-tools`
-for the script to detect them. The script builds both children and
-the branded hub from source into `release/FBVenoison/`. It does not copy private
-AI keys, account data, device assignments, debug logs, or screenshots into the
-release. Configure each app's AI settings on the target installation. For an
-existing installation, preserve its local configuration files when replacing
-executables. Point `FBVENOISON_POISON_EXE` or `FBVENOISON_VENOM_EXE` at a specific
-child executable to override bundled launch resolution. A managed FBVenom
-build emits `FBVenom.suite-bridge.json` beside its EXE; keep this matching
-file with the binary. The hub refuses a frozen Venom binary without that
-verified bridge, preventing it from taking devices assigned to Poison.
+The script creates an isolated `.venv-build` environment, installs the pinned
+build dependencies, finds Windows Android platform-tools (or downloads them
+from Google), and rebuilds **FBPoison**, **FBVenom**, and **FBVenoison** into
+`release/FBVenoison/`. It packages shared ADB tools with the suite and checks
+that all three EXEs and Venom's matching device bridge exist before registering
+paths. Close any running app windows before rebuilding their executables.
+
+After successful builds, it saves these **system environment values**:
+
+| Variable | Default value under the project folder |
+|---|---|
+| `VENOM` | `release\FBVenoison\FBVenom\FBVenom.exe` |
+| `POISON` | `release\FBVenoison\FBPoison\fbpoison.exe` |
+| `FBVENOISON_VENOM_EXE` | Same path as `VENOM` |
+| `FBVENOISON_POISON_EXE` | Same path as `POISON` |
+| `FBVENOISON_EXE` | `release\FBVenoison\fbvenoison.exe` |
+
+System registration also refreshes your account's matching values so an older
+user-level path cannot shadow the rebuilt apps. System registration requests
+Windows administrator approval after building;
+Python/build tools run without elevation. Use `-Scope User` to register only
+for your account without administrator approval. `-Launch` opens the rebuilt
+hub immediately with the new values. Restart an already-open hub to load the
+rebuilt applications. FBVenoison recognizes both `VENOM`/`POISON` aliases and
+the longer executable variable names, with bundled-file fallback.
+
+```powershell
+# Build and register for your account only, then launch.
+.\rebuild_windows.ps1 -Scope User -Launch
+
+# Choose Python, tools, and an output folder.
+.\rebuild_windows.ps1 -Python 'C:\Python312\python.exe' -PlatformTools 'C:\Android\platform-tools' -OutputDirectory 'C:\Apps\FBVenoison'
+
+# Register an existing completed build without rebuilding.
+.\rebuild_windows.ps1 -RegisterOnly -OutputDirectory 'C:\Apps\FBVenoison'
+
+# Build only, without changing persistent environment values.
+.\rebuild_windows.ps1 -SkipRegistration
+```
+
+`-SkipDependencyInstall` reuses the local build environment without running
+pip again. `build_windows.ps1` remains a compatible entry point and forwards
+the same options. Existing private settings in the output directory are kept;
+only empty example configurations are copied for a fresh installation.
+
+A managed FBVenom build emits `FBVenom.suite-bridge.json` beside its EXE; keep
+this matching file with the binary. The standalone upstream 1.1.1 EXE does
+not include that bridge, so rebuild before using it through a frozen hub.
 
 The bridge applies the hub's device list, shared ADB path, and existing unlock.
 While managed by the hub, FBVenom's own binary replacement actions direct you

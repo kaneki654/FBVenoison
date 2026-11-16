@@ -23,19 +23,79 @@ from version import VERSION
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+def _persistent_executable_values(names):
+    """Read Windows user and system values without changing the registry.
+
+    An already running desktop application can have an older environment than
+    the values registered by the rebuild script. Read the persisted values on
+    each launch when the inherited executable paths are missing or invalid.
+    """
+    if sys.platform != "win32":
+        return []
+    try:
+        import winreg
+    except ImportError:
+        return []
+    values = []
+    locations = (
+        (winreg.HKEY_CURRENT_USER, "Environment"),
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+    )
+    for root, subkey in locations:
+        try:
+            with winreg.OpenKey(root, subkey, 0, winreg.KEY_READ) as key:
+                for name in names:
+                    try:
+                        value, kind = winreg.QueryValueEx(key, name)
+                    except OSError:
+                        continue
+                    if kind in (winreg.REG_SZ, winreg.REG_EXPAND_SZ):
+                        values.append(value)
+        except OSError:
+            continue
+    return values
+
+
+def _registered_executable(role):
+    """Use explicit app overrides, then VENOM/POISON registered by the build."""
+    if role not in (boxes.POISON, boxes.VENOM):
+        return None
+    alias = "POISON" if role == boxes.POISON else "VENOM"
+    names = ("FBVENOISON_%s_EXE" % alias, alias)
+
+    def existing_path(value):
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
+            value = value[1:-1]
+        value = os.path.expandvars(value)
+        return value if value and os.path.isfile(value) else None
+
+    for name in names:
+        path = existing_path(os.environ.get(name))
+        if path:
+            return path
+    for value in _persistent_executable_values(names):
+        path = existing_path(value)
+        if path:
+            return path
+    return None
+
+
 def child_exe(role):
     """The standalone app .exe a frozen hub launches for a role.
 
-    Explicit overrides win. Otherwise prefer the apps shipped with this suite,
+    Explicit and registered executable values win. Otherwise prefer this suite,
     before checking legacy home-folder installations. A one-file hub extracts
     its Python modules to a temporary directory, so installed app paths must
     be resolved relative to the actual executable as well as this source file.
     """
     if role not in (boxes.POISON, boxes.VENOM):
         return None
-    env_name = "FBVENOISON_%s_EXE" % ("POISON" if role == boxes.POISON else "VENOM")
-    override = os.environ.get(env_name, "").strip()
-    if override and os.path.isfile(override):
+    override = _registered_executable(role)
+    if override:
         return override
     folder, filename = (("FBPoison", "fbpoison.exe") if role == boxes.POISON
                         else ("FBVenom", "FBVenom.exe"))

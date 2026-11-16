@@ -35,6 +35,11 @@ def _pin_adb():
             os.environ["ADB_PATH"] = cand
             print("[adb] suite pinned to %s" % cand)
             return
+    if sys.platform == "win32":
+        root = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else HERE
+        bundled = os.path.join(root, "platform-tools", "adb.exe")
+        if os.path.isfile(bundled):
+            os.environ["ADB_PATH"] = bundled
 
 
 def main():
