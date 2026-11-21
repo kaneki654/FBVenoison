@@ -20,6 +20,9 @@ for _stream in (sys.stdout, sys.stderr):
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TESTS = [
+    ("Python update and interpreter validation", "test_python_bootstrap.py"),
+    ("unchanged upstream FBVenom snapshot", "test_upstream_snapshot.py"),
+    ("external FBVenom build adapter", "test_venom_adapter_spec.py"),
     ("PowerShell rebuild and registration workflow", "test_rebuild_script.py"),
     ("rebuilt app launch integration", "test_rebuild_launch.py"),
     ("local credential settings", "test_private_settings.py"),

@@ -1,0 +1,56 @@
+name: Windows suite build
+on:
+  workflow_dispatch:
+  push:
+    branches: ['codex/windows-*']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          architecture: x64
+      - name: Rebuild all three Windows apps with real wheels
+        shell: powershell
+        run: |
+          .\rebuild_windows.ps1 -Python (Get-Command python.exe).Source -SkipPythonUpdate -SkipRegistration
+      - name: Run suite regression tests
+        shell: pwsh
+        run: .\.venv-build\Scripts\python.exe tests/run_all.py
+      - name: Run unchanged upstream FBVenom regressions
+        shell: pwsh
+        working-directory: FBVenom
+        run: ..\.venv-build\Scripts\python.exe -m unittest discover -p 'test_*.py' -v
+      - name: Verify upstream snapshot and native Venom startup
+        shell: pwsh
+        run: |
+          .\.venv-build\Scripts\python.exe tests/test_upstream_snapshot.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Push-Location FBVenom
+          try {
+            ..\.venv-build\Scripts\python.exe tools_validate_windows_build.py ..\release\FBVenoison\FBVenom\FBVenom.exe --source-commit '${{ github.sha }}'
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally { Pop-Location }
+      - name: Upload built suite
+        uses: actions/upload-artifact@v4
+        with:
+          name: FBVenoison-windows-x64
+          path: release/FBVenoison/
+          if-no-files-found: error
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build-logs
+          path: |
+            .build-tools/*.log
+            .build-tools/work/**/warn-*.txt
+          if-no-files-found: ignore

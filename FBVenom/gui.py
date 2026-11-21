@@ -11,8 +11,10 @@ import queue
 import json
 import copy
 import subprocess
+from urllib.parse import urlsplit
 import aiconfig
 import updater
+import usb_internet
 from workspaces import WorkspaceStore
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QGridLayout, QLabel, QLineEdit, QPushButton, QComboBox,
@@ -20,10 +22,10 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
     QSizePolicy, QButtonGroup, QGraphicsOpacityEffect, QGraphicsDropShadowEffect,
     QCheckBox, QDialog, QTabBar, QSpinBox, QMessageBox, QPlainTextEdit)
 from PyQt6.QtCore import (Qt, QTimer, QPropertyAnimation, QEasingCurve,
-    QRect, QRectF, QPointF, QSize, QVariantAnimation, QPoint)
+    QRect, QRectF, QPointF, QSize, QVariantAnimation, QPoint, QUrl, QObject, QEvent)
 from PyQt6.QtGui import (QPainter, QColor, QBrush, QPen, QFont, QFontDatabase,
     QPainterPath, QPolygonF, QPixmap, QIcon, QLinearGradient, QRadialGradient,
-    QCursor)
+    QCursor, QDesktopServices, QTextCursor)
 
 # Import core functions from fb_core
 import core as fbcore
@@ -1276,10 +1278,18 @@ class DeviceCard(QFrame):
     def play_in(self, delay=0):
         QTimer.singleShot(delay, self._anim.start)
 
+    # The "processing" pulse is decorative. Redrawing every phone's card 30
+    # times a second was a large share of the window's time with a big fleet;
+    # ~8 redraws a second still reads as a smooth pulse.
+    PULSE_REDRAW = 0.12
+
     def advance(self, dt):
         if self.status == 'processing':
             self.t += dt
-            self.update()
+            self._since_paint = getattr(self, "_since_paint", 0.0) + dt
+            if self._since_paint >= self.PULSE_REDRAW:
+                self._since_paint = 0.0
+                self.update()
 
     def set_status(self, status, detail=""):
         self.status = status
@@ -1718,6 +1728,7 @@ class AISettings(QDialog):
     def _load(self):
         cfg = aiconfig.load(force=True)
         prov = cfg.get("provider", "groq")
+        self._active_provider = prov
         if prov in self._keys:
             self.provider.blockSignals(True)
             self.provider.setCurrentIndex(self._keys.index(prov))
@@ -1732,7 +1743,21 @@ class AISettings(QDialog):
             self.tone.setCurrentIndex(self._tones.index(tone))
 
     def _preset_picked(self, idx):
-        p = aiconfig.PRESETS[self._keys[idx]]
+        name = self._keys[idx]
+        p = aiconfig.PRESETS[name]
+        if name == "lan":
+            profile = aiconfig.get_lan_profile()
+            p = {**p, "url": profile["url"], "model": profile["model"],
+                 "fallback": profile["fallback_model"], "min_gap": profile["min_gap"]}
+            self.key.setText(str(profile.get("api_key", "")))
+        elif getattr(self, "_active_provider", None) == "lan":
+            primary = aiconfig.load().get("primary_profile", {})
+            self.key.setText(str(primary.get("api_key", ""))
+                             if primary.get("provider") == name else "")
+            if primary.get("provider") == name:
+                p = {**p, "url": primary["url"], "model": primary["model"],
+                     "fallback": primary["fallback_model"], "min_gap": primary["min_gap"]}
+        self._active_provider = name
         self.url.setText(p["url"])
         self.model.setCurrentText(p["model"])
         self.fallback.setCurrentText(p["fallback"])
@@ -1788,15 +1813,22 @@ class AISettings(QDialog):
                 "tone": self._tones[self.tone.currentIndex()]}
 
     def _save(self):
-        cfg = aiconfig.load()
-        cfg.update(self._collect())
-        aiconfig.save(cfg)
+        try:
+            cfg = aiconfig.load()
+            cfg.update(self._collect())
+            aiconfig.save(cfg)
+        except Exception:
+            self._say("could not save settings · check the settings file permissions", C_BLOOD)
+            return False
+        fbcore.reset_ai_connection_state()
         self._say(f"saved  ·  {aiconfig.describe()}", C_TOXIC)
+        return True
 
     def _test(self):
         """Save first, then actually call the endpoint. A green result here
         means comments will really be generated during a run."""
-        self._save()
+        if not self._save():
+            return
         self._say("calling the endpoint…", C_MUTE)
         QApplication.processEvents()
         try:
@@ -1810,13 +1842,545 @@ class AISettings(QDialog):
             self._say(f"FAILED  ·  {type(e).__name__}: {e}", C_BLOOD)
 
 
-class UpdateDialog(QDialog):
-    """Install a published build, or go back to the one it replaced.
+class BackUpServ(QDialog):
+    """Verify the LAN gateway before replacing the active AI connection."""
 
-    Network work runs on a worker thread and reports through a polled result
-    slot rather than Qt signals - the same queue-and-timer shape the main
-    window already uses, so there is one concurrency pattern in this file.
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("BACKUP SERVER")
+        self.setMinimumWidth(640)
+        self.setStyleSheet(
+            f"QDialog{{background:{C_BG}}}"
+            f"QLabel{{color:{C_MUTE};font-family:'{F_UI}';font-size:12px;"
+            "background:transparent}" + _INPUT_QSS +
+            f"QComboBox{{background:{C_INPUT};color:{C_TEXT};border:1px solid {C_BORDER};"
+            f"border-radius:8px;padding:9px 12px;font-family:'{F_UI}';font-size:13px}}"
+            "QComboBox::drop-down{border:0;width:29px}"
+            "QComboBox::down-arrow{image:none}"
+            f"QComboBox QLineEdit{{background:transparent;color:{C_TEXT};border:0;padding:0}}"
+            f"QComboBox QAbstractItemView{{background:{C_CARD};color:{C_TEXT};"
+            f"selection-background-color:{C_TOXIC};selection-color:{C_VOID}}}")
+        self._busy = False
+        self._verified = False
+        self._closed = False
+        self._draft_revision = 0
+        self._results = queue.Queue()
+        load_failed = False
+        try:
+            cfg = aiconfig.load(force=True)
+            profile = aiconfig.get_lan_profile(cfg)
+        except Exception:
+            cfg = copy.deepcopy(aiconfig.DEFAULTS)
+            profile = aiconfig.get_lan_profile(cfg)
+            load_failed = True
+        self._mode = aiconfig.get_server_mode(cfg)
+
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(24, 22, 24, 20)
+        lo.setSpacing(14)
+        title = QLabel("BACKUP SERVER")
+        title.setStyleSheet(f"color:{C_TEXT};font-size:20px;font-weight:600;"
+                           f"font-family:'{F_DISP}';background:transparent")
+        lo.addWidget(title)
+        self.current_mode = QLabel()
+        self.current_mode.setStyleSheet(f"color:{C_TOXIC};font-weight:600")
+        lo.addWidget(self.current_mode)
+        intro = QLabel("Connect to your backup gateway on the same network. "
+                       "Your primary server settings are kept so you can switch back.")
+        intro.setWordWrap(True)
+        lo.addWidget(intro)
+
+        fields = QGridLayout()
+        fields.setHorizontalSpacing(14)
+        fields.setVerticalSpacing(12)
+        self.url = QLineEdit(str(profile.get("url", "")))
+        self.url.setAccessibleName("LAN gateway address")
+        self.url.setPlaceholderText("http://192.168.100.129:7499/v1")
+        fields.addWidget(QLabel("LAN address"), 0, 0)
+        fields.addWidget(self.url, 0, 1)
+        self.key = QLineEdit(str(profile.get("api_key", "")))
+        self.key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key.setAccessibleName("LAN API key")
+        self.key.setPlaceholderText("Separate API key from your LAN gateway")
+        self._key_origin = self._origin(self.url.text())
+        key_row = QHBoxLayout()
+        key_row.setSpacing(8)
+        key_row.addWidget(self.key, 1)
+        self.local_key_btn = GhostButton("Load local key")
+        self.local_key_btn.setToolTip("Load the saved key when this gateway runs on this computer")
+        self.local_key_btn.clicked.connect(self._load_local_key)
+        key_row.addWidget(self.local_key_btn)
+        fields.addWidget(QLabel("LAN API key"), 1, 0)
+        fields.addLayout(key_row, 1, 1)
+        self.model = PurpleComboBox()
+        self.model.setEditable(True)
+        self.model.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.model.setMinimumHeight(42)
+        self.model.setAccessibleName("LAN model")
+        self.model.setCurrentText(str(profile.get("model", "llama-sea-lion")))
+        fields.addWidget(QLabel("Model"), 2, 0)
+        fields.addWidget(self.model, 2, 1)
+        fields.setColumnStretch(1, 1)
+        lo.addLayout(fields)
+        note = QLabel("Test connection loads the available models. LAN mode uses "
+                      "only this gateway. Use HTTP on a trusted network or HTTPS "
+                      "with a trusted certificate.")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color:{C_FAINT};font-size:11px")
+        lo.addWidget(note)
+        self.status = QLabel("Gateway settings are ready. Test the connection or use LAN server."
+                             if self.key.text().strip() else
+                             "Enter the LAN API key, or load the key from this gateway computer.")
+        self.status.setWordWrap(True)
+        self.status.setMinimumHeight(48)
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
+        lo.addWidget(self.status)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.primary_btn = GhostButton("Use primary server")
+        self.primary_btn.clicked.connect(self._activate_primary)
+        row.addWidget(self.primary_btn)
+        row.addStretch()
+        self.test_btn = GhostButton("Test connection")
+        self.test_btn.clicked.connect(lambda: self._start_check(False))
+        row.addWidget(self.test_btn)
+        self.apply_btn = HazardButton("Use LAN server", C_TOXIC, primary=True, depth=0)
+        self.apply_btn.setMinimumSize(self.apply_btn.fontMetrics().horizontalAdvance(
+            self.apply_btn.text()) + 34, 40)
+        self.apply_btn.clicked.connect(lambda: self._start_check(True))
+        row.addWidget(self.apply_btn)
+        lo.addLayout(row)
+        close = GhostButton("Close")
+        close.clicked.connect(self.reject)
+        lo.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
+
+        self.url.textChanged.connect(self._address_changed)
+        self.key.textChanged.connect(self._invalidate_verification)
+        self.model.currentTextChanged.connect(self._invalidate_verification)
+        self._poll = QTimer(self)
+        self._poll.timeout.connect(self._drain)
+        self._poll.start(60)
+        self.finished.connect(self._on_finished)
+        self._refresh_mode()
+        if load_failed:
+            self.status.setText("Could not load saved server settings. Check the settings "
+                                "file before switching servers.")
+
+    def _refresh_mode(self):
+        self.current_mode.setText("LAN mode active" if self._mode == "lan"
+                                  else "Primary server active")
+        self._set_enabled(not self._busy)
+
+    def _set_enabled(self, enabled):
+        for widget in (self.url, self.key, self.model, self.local_key_btn,
+                       self.test_btn, self.apply_btn):
+            widget.setEnabled(enabled)
+        self.primary_btn.setEnabled(enabled and self._mode == "lan")
+
+    @staticmethod
+    def _origin(url):
+        try:
+            parsed = urlsplit(url.strip())
+            return parsed.scheme, parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError:
+            return None
+
+    def _address_changed(self, *_):
+        origin = self._origin(self.url.text())
+        if origin != self._key_origin:
+            # A key loaded for one gateway must not follow an address change.
+            self.key.clear()
+            self._key_origin = origin
+        self._invalidate_verification()
+
+    def _load_local_key(self):
+        if self._busy or self._closed:
+            return
+        key = aiconfig.get_local_lan_key(self.url.text())
+        if not key:
+            self.status.setText("No local key is available for this gateway. If it runs on "
+                                "another computer, enter the LAN key provided by its owner.")
+            return
+        self.key.setText(key)
+        self._key_origin = self._origin(self.url.text())
+        self.status.setText("LAN key loaded from this computer. Test the connection or use LAN server.")
+
+    def _invalidate_verification(self, *_):
+        self._draft_revision += 1
+        if self._verified:
+            self.status.setText("Settings changed. Test the connection again before switching.")
+        self._verified = False
+
+    def _can_switch(self):
+        if getattr(self.parent(), "running", False):
+            self.status.setText("Finish the session before switching servers.")
+            return False
+        return not self._closed
+
+    def _start_check(self, activate=False):
+        if self._busy or self._closed or (activate and not self._can_switch()):
+            return
+        try:
+            profile = aiconfig.build_lan_profile(
+                self.url.text(), self.key.text(), self.model.currentText())
+        except Exception:
+            self.status.setText("Check the LAN address, API key, and model. "
+                                "Use a private IPv4 address and the separate LAN key.")
+            return
+        self._busy = True
+        self._verified = False
+        self._set_enabled(False)
+        self.status.setText("Checking the LAN gateway and its available models…")
+        revision = self._draft_revision
+        results = self._results
+        validate = aiconfig.validate_lan_connection
+
+        def work():
+            # Only immutable draft data and this queue cross the thread boundary.
+            # Closing the dialog never allows a late worker to save settings.
+            try:
+                results.put(("ok", validate(profile), profile, activate, revision))
+            except Exception as exc:
+                results.put(("err", exc, profile, activate, revision))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _drain(self):
+        if self._closed:
+            return
+        try:
+            kind, value, profile, activate, revision = self._results.get_nowait()
+        except queue.Empty:
+            return
+        self._busy = False
+        self._set_enabled(True)
+        if revision != self._draft_revision:
+            self.status.setText("Settings changed during the check. Test the connection again.")
+            return
+        if kind == "err":
+            code = getattr(value, "code", None)
+            if code in (401, 403):
+                self.status.setText("LAN access was denied. Check the LAN API key "
+                                    "and that this computer is on the allowed network.")
+            else:
+                self.status.setText("Could not connect to the LAN gateway. Check the "
+                                    "address, key, network, and that the gateway is running.")
+            return
+        ids = [mid for mid in value if isinstance(mid, str) and mid]
+        if not ids:
+            self.status.setText("The LAN gateway returned no available models.")
+            return
+        selected = profile["model"]
+        self.model.blockSignals(True)
+        self.model.clear()
+        self.model.addItems(ids)
+        self.model.setCurrentText(selected if selected in ids else ids[0])
+        self.model.blockSignals(False)
+        self._verified = selected in ids
+        if not self._verified:
+            self.status.setText(f"Connected · {len(ids)} models available. "
+                                "Choose an available model, then use LAN server.")
+            return
+        if not activate:
+            self.status.setText(f"Connected · {len(ids)} models available. "
+                                "Use LAN server to switch.")
+            return
+        if self._can_switch():
+            self._save_mode("lan", profile)
+
+    def _activate_primary(self):
+        if not self._busy and self._can_switch():
+            self._save_mode("primary")
+
+    def _save_mode(self, mode, profile=None):
+        try:
+            if mode == "lan":
+                aiconfig.set_server_mode(mode, profile)
+            else:
+                aiconfig.set_server_mode(mode)
+        except Exception:
+            self.status.setText("Could not save server settings. Your active server "
+                                "has not changed. Check the settings file permissions.")
+            return
+        fbcore.reset_ai_connection_state()
+        self._mode = mode
+        self._refresh_mode()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "refresh_ai_status"):
+            try:
+                parent.refresh_ai_status()
+            except Exception:
+                pass  # The connection has already been saved successfully.
+        self.status.setText("LAN mode enabled. Requests now use your LAN gateway."
+                            if mode == "lan" else "Primary server restored.")
+
+    def _on_finished(self, *_):
+        self._closed = True
+        self._poll.stop()
+
+
+class USBInternetDialog(QDialog):
+    """Share this PC's internet with every phone on a USB cable.
+
+    Reverse tethering over USB debugging: each phone runs the Gnirehtet VPN
+    client and its traffic rides the cable to the PC, which sends it out over
+    its own Wi-Fi or Ethernet. The manager belongs to the main window, so the
+    phones stay online after this dialog closes; worker threads only touch a
+    queue, never a widget.
     """
+
+    STATES = {
+        "ready": ("Ready", C_MUTE),
+        "starting": ("Starting…", C_HAZARD),
+        "installing": ("Installing client…", C_HAZARD),
+        "approval_required": ("Tap OK on the phone's VPN prompt", C_HAZARD),
+        "vpn_active": ("Online via PC", C_TOXIC2),
+        "stopped": ("Stopped", C_FAINT),
+        "failed": ("Failed", C_BLOOD),
+        "stop_failed": ("Stop failed", C_BLOOD),
+        "unauthorized": ("USB debugging not authorized", C_BLOOD),
+        "offline": ("Offline", C_BLOOD),
+        "disconnected": ("Disconnected", C_BLOOD),
+        "unmanaged": ("Used by another tool", C_HAZARD),
+    }
+    ACTIONS = {"scan": "Looking for USB phones…",
+               "start": "Starting USB internet on every USB phone…",
+               "stop": "Stopping USB internet and restoring the phones…"}
+
+    def __init__(self, window):
+        super().__init__(window)
+        self._window = window
+        self._busy = False
+        self._closed = False
+        self._ticks = 0
+        self._results = queue.Queue()
+        self.setWindowTitle("USB INTERNET")
+        self.setMinimumWidth(700)
+        self.setStyleSheet(
+            f"QDialog{{background:{C_BG}}}"
+            f"QLabel{{color:{C_MUTE};font-family:'{F_UI}';font-size:12px;background:transparent}}"
+            f"QListWidget{{background:{C_INPUT};color:{C_TEXT};border:1px solid {C_BORDER};"
+            f"border-radius:8px;padding:4px;font-family:'{F_MONO}';font-size:11px}}"
+            f"QPlainTextEdit{{background:{C_INPUT};color:{C_TEXT};border:1px solid {C_BORDER};"
+            f"border-radius:8px;padding:6px;font-family:'{F_MONO}';font-size:11px}}")
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(24, 22, 24, 20)
+        lo.setSpacing(12)
+        title = QLabel("USB INTERNET")
+        title.setStyleSheet(f"color:{C_TEXT};font-size:20px;font-weight:600;"
+                            f"font-family:'{F_DISP}';background:transparent")
+        lo.addWidget(title)
+        intro = QLabel("Phones on a USB cable with USB debugging use this computer's "
+                       "internet through a VPN tunnel over the cable, so they no longer "
+                       "depend on their own Wi‑Fi or mobile data.")
+        intro.setWordWrap(True)
+        lo.addWidget(intro)
+        self.network = QLabel("Computer internet: not checked yet")
+        self.network.setWordWrap(True)
+        self.network.setStyleSheet(f"color:{C_TEXT};font-weight:600")
+        lo.addWidget(self.network)
+        self.devices = QListWidget()
+        self.devices.setAccessibleName("USB phones")
+        self.devices.setMinimumHeight(150)
+        lo.addWidget(self.devices)
+        self.auto_vpn = NeonCheck("Approve each phone's VPN prompt automatically over USB debugging")
+        self.auto_vpn.setChecked(getattr(window, "_usb_auto_vpn", True))
+        self.auto_vpn.setToolTip("Off: tap OK on Android's VPN connection request on every phone once.")
+        self.auto_vpn.toggled.connect(lambda on: setattr(window, "_usb_auto_vpn", bool(on)))
+        lo.addWidget(self.auto_vpn)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
+        self.status.setMinimumHeight(36)
+        lo.addWidget(self.status)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.scan_btn = GhostButton("Scan phones")
+        self.scan_btn.clicked.connect(lambda: self._run("scan"))
+        row.addWidget(self.scan_btn)
+        self.stop_btn = GhostButton("Stop all")
+        self.stop_btn.clicked.connect(lambda: self._run("stop"))
+        row.addWidget(self.stop_btn)
+        row.addStretch()
+        self.start_btn = HazardButton("Start USB internet", C_TOXIC, primary=True, depth=0)
+        self.start_btn.setMinimumSize(self.start_btn.fontMetrics().horizontalAdvance(
+            self.start_btn.text()) + 34, 40)
+        self.start_btn.clicked.connect(lambda: self._run("start"))
+        row.addWidget(self.start_btn)
+        lo.addLayout(row)
+        log_head = QHBoxLayout()
+        log_head.addWidget(QLabel("Activity and error log"))
+        log_head.addStretch()
+        self.copy_btn = GhostButton("Copy log")
+        self.copy_btn.clicked.connect(self._copy_log)
+        log_head.addWidget(self.copy_btn)
+        self.folder_btn = GhostButton("Open log folder")
+        self.folder_btn.clicked.connect(self._open_log_folder)
+        log_head.addWidget(self.folder_btn)
+        lo.addLayout(log_head)
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(4000)
+        self.log.setMinimumHeight(170)
+        self.log.setPlaceholderText("Events appear here with a code, the phone, and a suggested next step. "
+                                    "They are also saved to the log folder.")
+        lo.addWidget(self.log)
+        close = GhostButton("Close")
+        close.clicked.connect(self.reject)
+        lo.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
+        for event in list(getattr(window, "_usb_history", [])):
+            self.append_event(event)
+        self._poll = QTimer(self)
+        self._poll.timeout.connect(self._drain)
+        self._poll.start(150)
+        self.finished.connect(self._on_finished)
+        manager = window.usb_manager()
+        if manager is None:
+            self.status.setText("USB internet is unavailable: " + window.usb_helper_error()
+                                + " Reinstall this FBVenom build.")
+        else:
+            if getattr(window, "running", False):
+                self.status.setText("A session is running. Starting USB internet briefly "
+                                    "interrupts each phone's connection.")
+            self._run("scan")
+        self._refresh()
+
+    @staticmethod
+    def event_text(event):
+        severity = str(event.get("severity") or "info").upper()
+        head = f"[{event.get('time') or time.strftime('%H:%M:%S')}] {severity} {event.get('code') or ''}"
+        if event.get("serial"):
+            head += f" · {event['serial']}"
+        lines = [head, str(event.get("message") or "")]
+        if event.get("detail"):
+            lines.append("Detail: " + str(event["detail"]))
+        if event.get("hint") and severity != "INFO":
+            lines.append("Next step: " + str(event["hint"]))
+        return "\n".join(lines)
+
+    def append_event(self, event):
+        if not self._closed:
+            self.log.appendPlainText(self.event_text(event) + "\n")
+
+    def _copy_log(self):
+        QApplication.clipboard().setText(self.log.toPlainText())
+        self.status.setText("Log copied to the clipboard.")
+
+    def _open_log_folder(self):
+        manager = self._window.usb_manager()
+        path = getattr(manager, "log_path", "") if manager is not None else ""
+        folder = os.path.dirname(path) if path else os.path.join(HERE, "logs")
+        os.makedirs(folder, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+    def _run(self, action):
+        if self._busy or self._closed:
+            return
+        manager = self._window.usb_manager()
+        if manager is None:
+            return
+        manager.auto_approve_vpn = self.auto_vpn.isChecked()
+        operation = {"scan": manager.discover_usb, "start": manager.start_all,
+                     "stop": manager.stop_all}[action]
+        self._busy = True
+        self._set_enabled(False)
+        self.status.setText(self.ACTIONS[action])
+        results = self._results
+
+        def work():
+            # Only this queue crosses back to the GUI thread.
+            try:
+                operation()
+                results.put((action, None))
+            except Exception as exc:
+                results.put((action, exc))
+
+        threading.Thread(target=work, name=f"usb-internet-{action}", daemon=True).start()
+
+    def _set_enabled(self, enabled):
+        available = self._window.usb_internet is not None
+        for widget in (self.scan_btn, self.start_btn, self.stop_btn, self.auto_vpn):
+            widget.setEnabled(enabled and available)
+
+    def _drain(self):
+        if self._closed:
+            return
+        self._ticks += 1
+        try:
+            action, failure = self._results.get_nowait()
+        except queue.Empty:
+            if self._ticks % 7 == 0:
+                self._refresh()           # the monitor updates states on its own
+            return
+        self._busy = False
+        self._set_enabled(True)
+        self._refresh()
+        if failure is not None:
+            self.status.setText(f"USB internet {action} failed unexpectedly: "
+                                f"{type(failure).__name__}. See the log below.")
+            return
+        self.status.setText(self._summary(action))
+
+    def _summary(self, action):
+        manager = self._window.usb_internet
+        snap = manager.snapshot() if manager is not None else {"devices": []}
+        states = [row.get("state") for row in snap.get("devices", [])]
+        online = states.count("vpn_active")
+        waiting = states.count("approval_required")
+        failed = sum(state in ("failed", "stop_failed", "unauthorized", "offline") for state in states)
+        if not states:
+            return ("No USB phones found. Connect them with data cables, enable USB "
+                    "debugging and accept the computer's key on each phone, then scan again.")
+        parts = [f"{len(states)} USB phone{'s' if len(states) != 1 else ''}"]
+        if online:
+            parts.append(f"{online} online via PC")
+        if waiting:
+            parts.append(f"{waiting} waiting for VPN approval")
+        if failed:
+            parts.append(f"{failed} need attention (see log)")
+        if action == "stop":
+            parts.append("USB internet stopped" if not snap.get("running") else "relay still running")
+        return " · ".join(parts)
+
+    def _refresh(self):
+        manager = self._window.usb_internet
+        self._set_enabled(not self._busy)
+        if manager is None:
+            return
+        snap = manager.snapshot()
+        net = snap.get("network") or {}
+        if net:
+            kind = {"wifi": "Wi‑Fi", "ethernet": "Ethernet"}.get(net.get("kind"), net.get("kind") or "")
+            where = f" ({kind}: {net.get('interface')})" if net.get("interface") else ""
+            color = C_TOXIC2 if net.get("ok") and net.get("kind") == "wifi" else (
+                C_HAZARD if net.get("ok") else C_BLOOD)
+            self.network.setText(("Computer internet ready" if net.get("ok") else
+                                  "Computer internet problem: " + str(net.get("message") or "")) + where)
+            self.network.setStyleSheet(f"color:{color};font-weight:600")
+        self.devices.clear()
+        for row in snap.get("devices", []):
+            label, color = self.STATES.get(row.get("state"), (str(row.get("state") or "unknown"), C_MUTE))
+            model = f" · {row['model']}" if row.get("model") else ""
+            item = QListWidgetItem(f"{row.get('serial')}{model}  —  {label}"
+                                   + (f"  ({row['detail']})" if row.get("detail") and
+                                      row.get("state") in ("failed", "stop_failed") else ""))
+            item.setForeground(QColor(color))
+            self.devices.addItem(item)
+        if not snap.get("devices"):
+            item = QListWidgetItem("No USB phones listed yet")
+            item.setForeground(QColor(C_FAINT))
+            self.devices.addItem(item)
+
+    def _on_finished(self, *_):
+        self._closed = True
+        self._poll.stop()
+        if getattr(self._window, "_usb_dialog", None) is self:
+            self._window._usb_dialog = None
+
+
+class UpdateDialog(QDialog):
+    """Check and stage updates without touching Qt widgets from a worker."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1825,35 +2389,35 @@ class UpdateDialog(QDialog):
         self.setStyleSheet(
             f"QDialog{{background:{C_BG}}}"
             f"QLabel{{color:{C_MUTE};font-family:'{F_UI}';font-size:12px;"
-            "background:transparent}"
-            + _INPUT_QSS)
+            "background:transparent}" + _INPUT_QSS)
         self._busy = False
-        self._result = None
+        self._closed = False
         self._manifest = None
         self._staged = None
+        self._results = queue.Queue()
+        self._result_lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._revision = 0
+        self._restart_pending = False
+        self._quit_requested = False
+        self._stage_dir = os.path.abspath(updater.APP_DIR)
 
         lo = QVBoxLayout(self)
         lo.setContentsMargins(24, 22, 24, 20)
         lo.setSpacing(14)
-
         title = QLabel("Updates")
         title.setStyleSheet(f"color:{C_TEXT};font-size:20px;font-weight:600;"
-                            f"font-family:'{F_DISP}';background:transparent")
+                           f"font-family:'{F_DISP}';background:transparent")
         lo.addWidget(title)
-
         self.installed = QLabel(f"Installed version  {updater.APP_VERSION}")
-        self.installed.setStyleSheet(
-            f"color:{C_TEXT};font-size:13px;background:transparent")
+        self.installed.setStyleSheet(f"color:{C_TEXT};font-size:13px;background:transparent")
         lo.addWidget(self.installed)
-
         lo.addWidget(self._label("UPDATE ADDRESS"))
-        # Pre-filled with the permanent release channel, so a fresh PC has
-        # nothing to type. Still editable if the channel ever moves.
         self.url = QLineEdit(updater.load_settings().get("manifest_url", ""))
         self.url.setAccessibleName("Update address")
         lo.addWidget(self.url)
-
         self.status = QLabel("Check whether a newer build has been published.")
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
         self.status.setWordWrap(True)
         self.status.setMinimumHeight(48)
         lo.addWidget(self.status)
@@ -1873,7 +2437,9 @@ class UpdateDialog(QDialog):
         self.back_btn.setEnabled(updater.can_downgrade())
         row.addWidget(self.back_btn)
         lo.addLayout(row)
-
+        close = GhostButton("Close")
+        close.clicked.connect(self.reject)
+        lo.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
         if updater.can_downgrade():
             was = updater.previous_build_version()
             self.status.setText(
@@ -1883,85 +2449,200 @@ class UpdateDialog(QDialog):
         self._poll = QTimer(self)
         self._poll.timeout.connect(self._drain)
         self._poll.start(120)
+        self._restart_timer = QTimer(self)
+        self._restart_timer.setSingleShot(True)
+        self._restart_timer.timeout.connect(self._quit_after_install)
+        self.url.textChanged.connect(self._address_changed)
+        self.finished.connect(self._on_finished)
 
     def _label(self, text):
-        lab = QLabel(text)
-        lab.setStyleSheet(_FIELD_LBL)
-        return lab
+        label = QLabel(text)
+        label.setStyleSheet(_FIELD_LBL)
+        return label
 
-    # ── worker plumbing ────────────────────────────────────────────────
-    def _run(self, fn):
-        """Run one network step off the UI thread; _drain picks up the result."""
-        if self._busy:
+    @staticmethod
+    def _discard_staged(path, directory):
+        """Delete only a returned updater temporary, never an arbitrary path."""
+        import stat
+        try:
+            path = os.path.abspath(os.fspath(path))
+            if (not os.path.basename(path).startswith(".fbvenom-update-")
+                    or os.path.realpath(os.path.dirname(path)) != os.path.realpath(directory)):
+                return
+            info = os.lstat(path)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or (hasattr(os, "getuid") and info.st_uid != os.getuid())):
+                return
+            os.unlink(path)
+        except (OSError, TypeError, ValueError):
+            pass
+
+    def _run(self, step, operation):
+        if self._busy or self._closed or self._restart_pending:
             return
         self._busy = True
         self._set_enabled(False)
+        self._cancel = threading.Event()
+        cancel, results, lock = self._cancel, self._results, self._result_lock
+        revision, stage_dir = self._revision, self._stage_dir
+        discard = self._discard_staged
+
+        def report(done, total):
+            if cancel.is_set():
+                # updater.download owns and removes its partial file when a
+                # progress callback raises. No widget is touched here.
+                raise updater.UpdateError("Update cancelled.")
+            results.put(("progress", step, (done, total), revision))
 
         def work():
             try:
-                self._result = ("ok", fn())
-            except Exception as exc:                  # shown, never raised
-                self._result = ("err", exc)
+                payload = operation(report)
+                kind = "ok"
+            except Exception as exc:
+                payload, kind = exc, "err"
+            # Serialize publication with closing: either close drains the
+            # queued temporary or this worker discards the late result.
+            with lock:
+                if cancel.is_set():
+                    if kind == "ok" and step == "download":
+                        discard(payload, stage_dir)
+                    return
+                results.put((kind, step, payload, revision))
+
         threading.Thread(target=work, daemon=True).start()
 
-    def _set_enabled(self, on):
-        self.check_btn.setEnabled(on)
-        self.install_btn.setEnabled(on and self._manifest is not None)
-        self.back_btn.setEnabled(on and updater.can_downgrade())
+    def _set_enabled(self, enabled):
+        enabled = enabled and not self._closed and not self._restart_pending
+        self.url.setEnabled(enabled)
+        self.check_btn.setEnabled(enabled)
+        self.install_btn.setEnabled(enabled and self._manifest is not None)
+        self.back_btn.setEnabled(enabled and updater.can_downgrade())
+
+    def _address_changed(self, *_):
+        self._revision += 1
+        self._manifest = None
+        self.install_btn.setEnabled(False)
+        if not self._busy and not self._closed:
+            self.status.setText("Update address changed. Check for an update again.")
+
+    @staticmethod
+    def _error_text(error):
+        if isinstance(error, updater.UpdateError):
+            return str(error)
+        return "Could not complete the update. Check the update address and try again."
 
     def _drain(self):
-        if self._result is None:
+        if self._closed:
             return
-        kind, payload = self._result
-        self._result = None
-        self._busy = False
-        if kind == "err":
-            self._set_enabled(True)
-            self.status.setText(str(payload))
-            return
-        self._finish(payload)
+        while True:
+            try:
+                kind, step, payload, revision = self._results.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "progress":
+                if revision == self._revision and self._busy:
+                    done, total = payload
+                    if total and total > 0:
+                        percent = max(0, min(100, int(done * 100 // total)))
+                        self.status.setText(f"Downloading… {percent}%")
+                    else:
+                        self.status.setText(f"Downloading… {max(0, int(done)) // 1024} KB")
+                continue
+            self._busy = False
+            if revision != self._revision:
+                if kind == "ok" and step == "download":
+                    self._discard_staged(payload, self._stage_dir)
+                self.status.setText("Update address changed. Check for an update again.")
+                self._set_enabled(True)
+                continue
+            if kind == "err":
+                self.status.setText(self._error_text(payload))
+                self._set_enabled(True)
+                continue
+            self._finish((step, payload))
 
     def _finish(self, payload):
         step, value = payload
+        if self._closed:
+            if step == "download":
+                self._discard_staged(value, self._stage_dir)
+            return
         if step == "check":
             manifest, available = value
+            self._manifest = manifest if available else None
             if available:
-                self._manifest = manifest
-                notes = f"\n{manifest['notes']}" if manifest["notes"] else ""
-                self.status.setText(
-                    f"Version {manifest['version']} is available "
-                    f"(you have {updater.APP_VERSION}).{notes}")
+                notes = f"\n{manifest['notes']}" if manifest.get("notes") else ""
+                self.status.setText(f"Version {manifest['version']} is available "
+                                    f"(you have {updater.APP_VERSION}).{notes}")
             else:
-                self._manifest = None
-                self.status.setText(
-                    f"You already have the newest build "
-                    f"({manifest['version']}).")
+                self.status.setText(f"You already have the newest build ({manifest['version']}).")
             self._set_enabled(True)
         elif step == "download":
             self._staged = value
-            self.status.setText("Download verified. Restarting into the new "
-                                "build…")
-            updater.install(self._staged)
-            QTimer.singleShot(400, QApplication.quit)
+            try:
+                updater.install(value)
+            except Exception as exc:
+                self._discard_staged(value, self._stage_dir)
+                self._staged = None
+                self.status.setText(self._error_text(exc))
+                self._set_enabled(True)
+                return
+            self._staged = None  # The installer now owns this verified file.
+            self.status.setText("Download verified. Restarting into the new build…")
+            self._restart_pending = True
+            self._set_enabled(False)
+            self._restart_timer.start(400)
 
-    # ── actions ────────────────────────────────────────────────────────
+    def _quit_after_install(self):
+        if self._restart_pending and not self._quit_requested:
+            self._quit_requested = True
+            self._restart_timer.stop()
+            QApplication.quit()
+
+    def _on_finished(self, *_):
+        if self._closed:
+            return
+        self._closed = True
+        self._busy = False
+        self._poll.stop()
+        # Once the swap helper has accepted the handoff, it waits for this
+        # process to exit. Closing this dialog must still finish that handoff.
+        if not self._restart_pending:
+            self._restart_timer.stop()
+        with self._result_lock:
+            self._cancel.set()
+            while True:
+                try:
+                    kind, step, payload, _ = self._results.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "ok" and step == "download":
+                    self._discard_staged(payload, self._stage_dir)
+
+    def closeEvent(self, event):
+        self._on_finished()
+        super().closeEvent(event)
+
     def check(self):
+        if self._busy or self._closed or self._restart_pending:
+            return
         url = self.url.text().strip()
+        check = updater.check
         self.status.setText("Checking…")
         self._manifest = None
-        self._run(lambda: ("check", updater.check(url)))
+        self._run("check", lambda report: check(url))
 
     def install(self):
-        if not self._manifest:
+        if not self._manifest or self._busy or self._closed or self._restart_pending:
             return
+        manifest = copy.deepcopy(self._manifest)
+        download = updater.download
         self.status.setText("Downloading…")
-
-        def report(done, total):
-            if total:
-                self.status.setText(f"Downloading… {done * 100 // total}%")
-        self._run(lambda: ("download", updater.download(self._manifest, report)))
+        self._run("download", lambda report: download(manifest, report))
 
     def rollback(self):
+        if self._busy or self._closed or self._restart_pending:
+            return
         was = updater.previous_build_version()
         confirm = QMessageBox.question(
             self, "Go back to the previous build?",
@@ -1970,15 +2651,17 @@ class UpdateDialog(QDialog):
             + "\n\nThe current build is kept, so you can move forward again.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
-        if confirm != QMessageBox.StandardButton.Yes:
+        if confirm != QMessageBox.StandardButton.Yes or self._closed:
             return
         try:
             updater.downgrade()
         except Exception as exc:
-            self.status.setText(str(exc))
+            self.status.setText(self._error_text(exc))
             return
         self.status.setText("Restarting into the previous build…")
-        QTimer.singleShot(400, QApplication.quit)
+        self._restart_pending = True
+        self._set_enabled(False)
+        self._restart_timer.start(400)
 
 
 class WorkspaceDialog(QDialog):
@@ -2158,14 +2841,33 @@ class ReactionGUI(QMainWindow):
         self.ai_btn.setFixedWidth(136)
         self.ai_btn.setToolTip("Configure your AI provider, model, and comment tone")
         self.ai_btn.clicked.connect(self.open_ai_settings)
+        self.backup_btn = GhostButton("Backup server")
+        self.backup_btn.setToolTip("Switch between the primary AI server and your LAN gateway")
+        self.backup_btn.clicked.connect(self.open_backup_server)
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
         buttons.addStretch()
+        # USB reverse tethering: owned by the window so phones stay online
+        # after its dialog closes; stopped (and phones restored) on exit.
+        self.usb_internet = None
+        self._usb_dialog = None
+        self._usb_history = []
+        self._usb_helper_error = ""
+        self._usb_auto_vpn = True
+        # The core must not restart ADB or stop Gnirehtet VPNs while this
+        # window's USB internet is sharing the connection through them.
+        fbcore.USB_INTERNET_ACTIVE = self.usb_internet_running
+        self.usb_btn = GhostButton("USB internet")
+        self.usb_btn.setToolTip("Share this computer's internet with every phone on a "
+                                "USB cable (USB debugging on)")
+        self.usb_btn.clicked.connect(self.open_usb_internet)
+        buttons.addWidget(self.usb_btn)
         self.update_btn = GhostButton("Updates")
         self.update_btn.setToolTip("Install a published build, or go back to "
                                    "the previous one")
         self.update_btn.clicked.connect(self.open_updates)
         buttons.addWidget(self.update_btn)
+        buttons.addWidget(self.backup_btn)
         buttons.addWidget(self.ai_btn)
         ai.addLayout(buttons)
         self.ai_status = QLabel("")
@@ -2350,6 +3052,10 @@ class ReactionGUI(QMainWindow):
             "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0}"
             "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent}")
         self.dev_list.setAccessibleName("Connected devices")
+        # During a session the list stays scrollable; only its selection is frozen.
+        self._device_list_guard = _ViewOnlyFilter(self.dev_list)
+        self.dev_list.viewport().installEventFilter(self._device_list_guard)
+        self.dev_list.installEventFilter(self._device_list_guard)
         self.dev_list.setMouseTracking(True)
         self.dev_list.viewport().setMouseTracking(True)
         self.dev_list.itemEntered.connect(self.on_device_hover)
@@ -2499,8 +3205,13 @@ class ReactionGUI(QMainWindow):
         self.session_options_btn.setText("Session options  ▾" if expanded else "Session options  ▸")
         self.update_briefing()
 
+    # How many diagnostics the panel keeps. Each one is appended and the oldest
+    # trimmed in constant time - see _append_diagnostic.
+    DIAGNOSTIC_LIMIT = 500
+
     def _build_diagnostics(self, root):
         self._diagnostic_events = []
+        self._diagnostic_blocks = []      # text lines each event occupies in the view
         self._diagnostic_errors = 0
         self._diagnostic_warnings = 0
         self.diagnostics = QFrame()
@@ -2534,7 +3245,9 @@ class ReactionGUI(QMainWindow):
         self.diagnostics_log.setAccessibleName("Session diagnostics log")
         self.diagnostics_log.setReadOnly(True)
         self.diagnostics_log.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        self.diagnostics_log.document().setMaximumBlockCount(4000)
+        # _append_diagnostic keeps the view to DIAGNOSTIC_LIMIT events itself;
+        # this is only a backstop far above what 500 events can occupy.
+        self.diagnostics_log.document().setMaximumBlockCount(20000)
         self.diagnostics_log.setFixedHeight(138)
         self.diagnostics_log.setStyleSheet(
             f"QPlainTextEdit{{background:{C_INPUT};color:{C_MUTE};border:1px solid {C_BORDER};"
@@ -2581,20 +3294,41 @@ class ReactionGUI(QMainWindow):
             lines.append("Target: " + str(event["url"]))
         return "\n".join(lines)
 
+    def _count_diagnostic(self, event, step):
+        # A missing severity is an error; "info" notices (AI recovered, phone
+        # online) are shown, not counted.
+        if event.get("severity", "error") == "error":
+            self._diagnostic_errors += step
+        elif event.get("severity") not in ("info", None):
+            self._diagnostic_warnings += step
+
     def _append_diagnostic(self, event):
+        """Show one diagnostic, in constant time however long the session runs.
+
+        Once 500 were kept, every new one used to rebuild the WHOLE log
+        (setPlainText of all 500, plus recounting them) on the window's own
+        thread. A busy fleet reports several a second, so after a few minutes
+        that was most of the window's time - measured with 30 simulated phones,
+        412 rebuilds in 10 s - and on a slower PC the window stopped answering
+        clicks and scrolling for the rest of the session. Now the new text is
+        appended and only the oldest event's own lines are cut from the top,
+        so the view and Copy log still agree.
+        """
         event = dict(event)
+        text = self._diagnostic_text(event)
         self._diagnostic_events.append(event)
-        if len(self._diagnostic_events) > 500:
-            self._diagnostic_events.pop(0)
-        self._diagnostic_errors = sum(e.get("severity", "error") == "error"
-                                      for e in self._diagnostic_events)
-        self._diagnostic_warnings = len(self._diagnostic_events) - self._diagnostic_errors
-        # Rebuild only at the bound so the plain-text view and Copy log agree.
-        if len(self._diagnostic_events) == 500:
-            self.diagnostics_log.setPlainText("\n\n".join(
-                self._diagnostic_text(e) for e in self._diagnostic_events))
-        else:
-            self.diagnostics_log.appendPlainText(self._diagnostic_text(event) + "\n")
+        # appendPlainText(text + "\n") occupies the text's lines plus one blank.
+        self._diagnostic_blocks.append(text.count("\n") + 2)
+        self._count_diagnostic(event, +1)
+        while len(self._diagnostic_events) > self.DIAGNOSTIC_LIMIT:
+            self._count_diagnostic(self._diagnostic_events.pop(0), -1)
+            blocks = self._diagnostic_blocks.pop(0)
+            cursor = QTextCursor(self.diagnostics_log.document())
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            cursor.movePosition(QTextCursor.MoveOperation.NextBlock,
+                                QTextCursor.MoveMode.KeepAnchor, blocks)
+            cursor.removeSelectedText()
+        self.diagnostics_log.appendPlainText(text + "\n")
         self._refresh_diagnostics_label()
         self.diagnostics_hint.setText(str(event.get("message") or event.get("code", "")))
         self.diagnostics_hint.setToolTip(self.diagnostics_hint.text())
@@ -2606,6 +3340,7 @@ class ReactionGUI(QMainWindow):
 
     def _clear_diagnostics(self):
         self._diagnostic_events.clear()
+        self._diagnostic_blocks.clear()
         self._diagnostic_errors = self._diagnostic_warnings = 0
         self.diagnostics_log.clear()
         self.diagnostics_hint.setText("Errors stay here after the session.")
@@ -2940,11 +3675,24 @@ class ReactionGUI(QMainWindow):
         self.new_workspace_btn.setEnabled(not self._workspace_load_error)
         self.edit_workspace_btn.setEnabled(bool(self.current_workspace_id))
         self.delete_workspace_btn.setEnabled(bool(self.current_workspace_id))
-        self.cfg_panel.setEnabled(idle and configured)
-        self.devices_panel.setEnabled(idle)
+        # The link list and the device list stay scrollable and readable while a
+        # session runs. Disabling the whole panels is what made the window feel
+        # frozen - a disabled panel will not even scroll - so only what the
+        # running session depends on is locked.
+        self.cfg_panel.setEnabled(configured)
+        for row in self.link_rows:
+            row.set_locked(not idle)
+        self.add_link_btn.setEnabled(idle)
+        self.devices_panel.setEnabled(True)
+        self._device_list_guard.active = not idle
+        self.all_btn.setEnabled(idle)
+        self.refresh_btn.setEnabled(idle)
+        for pill in self.device_pills.values():
+            pill.setEnabled(idle)
         self.dose_rate.setEnabled(idle and configured)
         self.screenshot_check.setEnabled(idle and configured)
         self.ai_btn.setEnabled(idle)
+        self.backup_btn.setEnabled(idle)
         self.start_btn.setEnabled(idle and configured)
         self.stop_btn.setEnabled(self.running and not self.stop_flag)
 
@@ -2958,6 +3706,8 @@ class ReactionGUI(QMainWindow):
             self.workspace_save_error.show()
             event.ignore()
             return
+        # Phones on a stopped relay would keep a dead VPN and no internet.
+        self._shutdown_usb_internet()
         super().closeEvent(event)
 
     def resizeEvent(self, ev):
@@ -3223,19 +3973,64 @@ class ReactionGUI(QMainWindow):
         except OSError:
             pass
 
+    # Display updates that only ever show the LATEST value: a burst of them
+    # collapses to its last one. Everything else is handled in arrival order.
+    _LATEST_ONLY = frozenset({"status", "msg", "progress", "stats"})
+    # Window time one tick may spend on worker messages (the tick is 100 ms).
+    QUEUE_BUDGET = 0.040
+
     def process_queue(self):
-        while not self.output_queue.empty():
+        """Show what the phone workers reported, without starving the window.
+
+        This used to run until the queue was empty, so a fleet reporting faster
+        than the window could draw kept it here and every click and scroll
+        waited. Each tick now has a time budget; repeated "latest value"
+        updates collapse to one; anything left waits for the next tick.
+        """
+        deadline = time.perf_counter() + self.QUEUE_BUDGET
+        pending = {}
+
+        def flush():
+            for message in pending.values():
+                self._handle_safely(message)
+            pending.clear()
+
+        while time.perf_counter() < deadline:
             try:
                 msg = self.output_queue.get_nowait()
-                if isinstance(msg, dict):
-                    self.handle_cmd(msg)
             except queue.Empty:
                 break
+            if not isinstance(msg, dict):
+                continue
+            action = msg.get("action")
+            if action in self._LATEST_ONLY:
+                key = action
+            elif action == "device_progress":
+                key = (action, msg.get("serial"))
+            else:
+                key = None
+            if key is not None:
+                pending.pop(key, None)       # keep the latest, in its new place
+                pending[key] = msg
+                continue
+            flush()                          # order kept around everything else
+            self._handle_safely(msg)
+        flush()
+
+    def _handle_safely(self, msg):
+        # One bad message must not leave the rest of the queue unshown.
+        try:
+            self.handle_cmd(msg)
+        except Exception as exc:
+            print(f"[ui] could not show {msg.get('action')!r}: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
 
     def handle_cmd(self, cmd):
         a = cmd.get("action")
         if a == "diagnostic":
             self._append_diagnostic(cmd.get("event") or {})
+        elif a == "usb_event":
+            self._on_usb_event(cmd.get("event") or {})
         elif a == "status":
             text = str(cmd.get("text", "")).upper()
             self.status_label.setText({"SPREADING…": "RUNNING", "PURGING…": "STOPPING"}.get(text, text))
@@ -3346,9 +4141,101 @@ class ReactionGUI(QMainWindow):
 
     def open_ai_settings(self):
         """Open the endpoint editor, then refresh the little status caption."""
+        if self.running:
+            self.send_cmd({"action": "toast", "text": "Finish the session before changing AI settings"})
+            return
         dlg = AISettings(self)
         dlg.exec()
         self.refresh_ai_status()
+
+    def open_backup_server(self):
+        if self.running:
+            self.send_cmd({"action": "toast", "text": "Finish the session before switching servers"})
+            return
+        BackUpServ(self).exec()
+        self.refresh_ai_status()
+
+    # ── USB internet (reverse tethering) ──
+    def usb_manager(self):
+        """The window's tethering manager, created on first use; None when the
+        bundled helpers are missing (usb_helper_error() says why)."""
+        if self.usb_internet is None:
+            try:
+                relay, apk = usb_internet.find_helpers()
+                self.usb_internet = usb_internet.USBInternetManager(
+                    fbcore.ADB, relay, apk, on_event=self._usb_event_from_worker,
+                    log_dir=os.path.join(HERE, "logs"), auto_approve_vpn=self._usb_auto_vpn)
+                self._usb_helper_error = ""
+            except Exception as exc:
+                self._usb_helper_error = f"{type(exc).__name__}: {exc}."
+                return None
+        return self.usb_internet
+
+    def usb_helper_error(self):
+        return self._usb_helper_error or "the helper files could not be loaded."
+
+    def usb_internet_running(self):
+        """True while this window's relay is up (any thread may ask)."""
+        manager = self.usb_internet
+        if manager is None:
+            return False
+        try:
+            return bool(manager.snapshot().get("running"))
+        except Exception:
+            return False
+
+    def _usb_event_from_worker(self, event):
+        # Manager threads never touch widgets: hop through the UI queue.
+        self.send_cmd({"action": "usb_event", "event": dict(event)})
+
+    def _on_usb_event(self, event):
+        self._usb_history.append(event)
+        del self._usb_history[:-500]
+        dialog = self._usb_dialog
+        if dialog is not None:
+            dialog.append_event(event)
+        if event.get("severity") in ("error", "warning"):
+            self._append_diagnostic({**event, "message": "USB internet: " + str(event.get("message") or "")})
+        self._refresh_usb_button()
+
+    def _refresh_usb_button(self):
+        manager = self.usb_internet
+        online = 0
+        if manager is not None:
+            try:
+                online = sum(row.get("state") == "vpn_active" for row in manager.snapshot()["devices"])
+            except Exception:
+                online = 0
+        self.usb_btn.setText(f"USB internet · {online}" if online else "USB internet")
+        self.usb_btn.setToolTip(f"{online} phone(s) online through this computer"
+                                if online else "Share this computer's internet with every phone "
+                                               "on a USB cable (USB debugging on)")
+
+    def open_usb_internet(self):
+        dialog = USBInternetDialog(self)
+        self._usb_dialog = dialog
+        try:
+            dialog.exec()
+        finally:
+            self._usb_dialog = None
+            self._refresh_usb_button()
+
+    def _shutdown_usb_internet(self, wait=20.0):
+        """Stop every owned VPN and the relay so no phone is left without internet."""
+        manager, self.usb_internet = self.usb_internet, None
+        if manager is None:
+            return
+        done = threading.Event()
+
+        def stop():
+            try:
+                manager.close()
+            except Exception:
+                pass
+            finally:
+                done.set()
+        threading.Thread(target=stop, name="usb-internet-shutdown", daemon=True).start()
+        done.wait(wait)
 
     def refresh_ai_status(self):
         """Say plainly whether comments will actually be AI-generated.
@@ -3485,6 +4372,8 @@ class ReactionGUI(QMainWindow):
         return row
 
     def remove_link_row(self, row):
+        if self.running:
+            return              # the running session was started with this link
         if len(self.link_rows) <= 1:
             self.send_cmd({"action": "toast", "text": "At least one link is required"})
             return
@@ -4166,6 +5055,21 @@ class CommentPill(QPushButton):
         p.end()
 
 
+class _ViewOnlyFilter(QObject):
+    """While active, a list still scrolls (wheel, scrollbar) and shows its
+    tooltips, but clicks and keys that would change its selection are ignored."""
+
+    BLOCKED = frozenset({QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease,
+                         QEvent.Type.MouseButtonDblClick, QEvent.Type.KeyPress})
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.active = False
+
+    def eventFilter(self, obj, event):
+        return bool(self.active and event.type() in self.BLOCKED)
+
+
 class LinkRow(QFrame):
     """One target: <link> <reaction> <example comment>."""
 
@@ -4274,6 +5178,15 @@ class LinkRow(QFrame):
         self.reaction.setVisible(show_reaction)
         self.comment.setVisible(show_comment)
         self._comment_label.setVisible(show_comment)
+
+    def set_locked(self, locked):
+        """Read-only while a session runs: still readable, selectable and
+        copyable, and the list around it still scrolls - only what the running
+        session was started with cannot change."""
+        self.url.setReadOnly(locked)
+        self.comment.setReadOnly(locked)
+        self.reaction.setEnabled(not locked)
+        self.kill.setEnabled(not locked)
 
     def target(self):
         return {"url": self.url.text().strip(),

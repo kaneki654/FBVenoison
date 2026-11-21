@@ -39,7 +39,13 @@ def main():
 
     import core
 
-    if allow:
+    managed_venom = label.upper() == "FBVENOM" or os.path.basename(app_dir).lower() == "fbvenom"
+    if managed_venom:
+        # The upstream files stay byte-identical. The external adapter also
+        # scopes the newer USB internet device discovery to this app's phones.
+        import venom_bridge
+        venom_bridge.apply()
+    elif allow:
         real_list = core.list_devices
 
         def list_devices():
@@ -55,7 +61,7 @@ def main():
 
     # The hub already asked for the key; do not ask a second time for a child
     # it spawned itself. Launched directly (no hub), the gate runs as normal.
-    if os.environ.get("FBVENOISON_AUTHED") == "1":
+    if not managed_venom and os.environ.get("FBVENOISON_AUTHED") == "1":
         try:
             import auth
             auth.require_key = lambda *a, **k: True

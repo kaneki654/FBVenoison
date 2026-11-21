@@ -31,35 +31,49 @@ class WindowsBuildSpecTests(unittest.TestCase):
         self.tools.mkdir()
         for name in TOOL_NAMES:
             (self.tools / name).write_bytes(_pe_stub())
+        self.helpers = self.root / "gnirehtet"
+        self.helpers.mkdir()
+        (self.helpers / "gnirehtet.exe").write_bytes(_pe_stub())
+        for name in ("gnirehtet.apk", "LICENSE", "provenance.json"):
+            (self.helpers / name).write_bytes(b"stub")
+        self.verified = []
 
-    def _evaluate(self, platform="win32", override=None):
+    def _verify_assets(self, directory, platform=None):
+        # Stands in for the hash/provenance verifier; the real one is covered
+        # in test_usb_internet. Mirrors its contract: raise on a bad folder.
+        directory = Path(directory)
+        self.verified.append((directory, platform))
+        if not (directory / "gnirehtet.exe").is_file():
+            raise ValueError("USB Internet helper directory is missing or unsafe")
+        return {"relay": str(directory / "gnirehtet.exe"), "apk": str(directory / "gnirehtet.apk"),
+                "license": str(directory / "LICENSE"), "provenance": {}}
+
+    def _evaluate(self, platform="win32", override=None, helpers=None):
         collect = Mock(return_value=([], [], []))
         analysis = Mock(return_value=SimpleNamespace(
             pure=[], scripts=[], binaries=[], datas=[]))
-        # No PyInstaller binary is created in this fixture. Verify that the
-        # spec requests capability emission only for EXE's completed output.
-        built_executable = str(self.root / "dist" / "FBVenom.exe")
-        exe = Mock(return_value=SimpleNamespace(name=built_executable))
-        write_metadata = Mock()
 
         def import_module(name, *args, **kwargs):
             if name == "sys":
-                return SimpleNamespace(platform=platform, path=[])
+                return SimpleNamespace(platform=platform)
             if name == "PyInstaller.utils.hooks":
                 return SimpleNamespace(collect_all=collect)
-            if name == "suite_bridge":
-                return SimpleNamespace(write_build_metadata=write_metadata)
+            if name == "tools_prepare_usb_internet":
+                return SimpleNamespace(verify_assets=self._verify_assets)
             return builtins.__import__(name, *args, **kwargs)
 
         namespace = {
             "SPEC": str(self.root / "FBVenom.spec"),
-            "Analysis": analysis, "PYZ": Mock(), "EXE": exe,
+            "Analysis": analysis, "PYZ": Mock(), "EXE": Mock(),
             "__builtins__": dict(vars(builtins), __import__=import_module),
         }
         with patch.dict(os.environ):
             os.environ.pop("FBVENOM_PLATFORM_TOOLS", None)
+            os.environ.pop("FBVENOM_GNIREHTET_DIR", None)
             if override is not None:
                 os.environ["FBVENOM_PLATFORM_TOOLS"] = str(override)
+            if helpers is not None:
+                os.environ["FBVENOM_GNIREHTET_DIR"] = str(helpers)
             exec(compile(SPEC_SOURCE, "FBVenom.spec", "exec"), namespace)
         return analysis.call_args.kwargs, namespace
 
@@ -71,21 +85,19 @@ class WindowsBuildSpecTests(unittest.TestCase):
         arguments, namespace = self._evaluate()
         self.assertEqual(arguments["binaries"], [
             (str((self.tools / name).resolve()), "platform-tools")
-            for name in TOOL_NAMES])
+            for name in TOOL_NAMES] + [
+            (str((self.helpers / "gnirehtet.exe").resolve()), "gnirehtet")])
+        self.assertEqual(self.verified, [(self.helpers.resolve(), "windows")])
         self.assertFalse(namespace["EXE"].call_args.kwargs["upx"])
         self.assertEqual(namespace["collect_all"].call_count, 3)
-
-    def test_suite_marker_targets_only_the_completed_rebuilt_executable(self):
-        _, namespace = self._evaluate()
-        namespace["write_build_metadata"].assert_called_once_with(
-            str(self.root / "dist" / "FBVenom.exe"))
 
     def test_platform_tools_directory_can_be_overridden(self):
         custom = self.root / "downloaded tools"
         self.tools.rename(custom)
         arguments, _ = self._evaluate(override=custom)
         self.assertEqual({Path(source).parent.resolve()
-                          for source, _ in arguments["binaries"]},
+                          for source, target in arguments["binaries"]
+                          if target == "platform-tools"},
                          {custom.resolve()})
 
     def test_rejects_a_missing_dll(self):
@@ -114,7 +126,24 @@ class WindowsBuildSpecTests(unittest.TestCase):
             (self.root / name).write_text("private runtime data")
         arguments, _ = self._evaluate()
         bundled = [Path(source).name for source, _ in arguments["datas"]]
-        self.assertEqual(set(bundled), {"icon.png", "icon.ico", "icon_nobg.png"})
+        self.assertEqual(set(bundled), {"icon.png", "icon.ico", "icon_nobg.png",
+                                        "gnirehtet.apk", "LICENSE", "provenance.json"})
+
+    def test_usb_internet_helpers_are_bundled_from_an_override_directory(self):
+        custom = self.root / "pinned helpers"
+        self.helpers.rename(custom)
+        arguments, _ = self._evaluate(helpers=custom)
+        self.assertIn((str((custom / "gnirehtet.exe").resolve()), "gnirehtet"), arguments["binaries"])
+        self.assertEqual({target for source, target in arguments["datas"]
+                          if Path(source).parent == custom.resolve()}, {"gnirehtet"})
+
+    def test_build_stops_when_usb_internet_helpers_are_missing_or_not_windows(self):
+        (self.helpers / "gnirehtet.exe").unlink()
+        with self.assertRaisesRegex(ValueError, "USB Internet helper"):
+            self._evaluate()
+        (self.helpers / "gnirehtet.exe").write_bytes(b"\x7fELF" + b"\0" * 128)
+        with self.assertRaisesRegex(ValueError, "Windows PE binary"):
+            self._evaluate()
 
 
 if __name__ == "__main__":

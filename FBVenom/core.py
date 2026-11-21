@@ -13,9 +13,14 @@ import random
 import json
 import threading
 import concurrent.futures
+import http.client
+import io
+import socket
+import ssl
 import urllib.request
 import urllib.error
 import urllib.parse
+import urllib.response
 from typing import Any
 import xml.etree.ElementTree as ET
 import uiautomator2 as u2
@@ -1275,7 +1280,148 @@ SUSPENDED_MARKERS = (
     "appeal",
 )
 
-NOPROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_AI_SSL_CONTEXT = [None]
+_AI_SSL_LOCK = threading.Lock()
+
+
+def _ai_ssl_context():
+    with _AI_SSL_LOCK:
+        if _AI_SSL_CONTEXT[0] is None:
+            _AI_SSL_CONTEXT[0] = ssl.create_default_context()
+        return _AI_SSL_CONTEXT[0]
+
+
+class _KeepAliveAIHandler(urllib.request.BaseHandler):
+    """Reuse TCP/TLS connections for AI chat requests, and only for those.
+
+    urllib opens a brand-new connection for every request. Against the
+    Cloudflare-fronted endpoint that is DNS + TCP + TLS before the prompt is
+    even sent - measured at ~0.8s of a ~1.1s round trip - and one comment often
+    needs two or three calls once the quality gates reject a wording. Requests
+    opt in by carrying ``_ai_keepalive``; every other request on these openers
+    (link resolution, Pollinations, update checks) falls through to the stock
+    handlers untouched. The body is read in full before the connection goes
+    back to the pool, so a caller can never leave a half-read response on a
+    socket another phone is about to reuse.
+    """
+
+    handler_order = 450          # ahead of the stock HTTP(S)Handler (500)
+    MAX_IDLE = 8
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._idle = {}
+        self._epoch = 0
+
+    def reset(self):
+        """Drop idle sockets, e.g. after the endpoint or its key changed."""
+        with self._lock:
+            idle, self._idle = self._idle, {}
+            self._epoch += 1
+        for pool in idle.values():
+            for conn in pool:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def idle_count(self):
+        with self._lock:
+            return sum(len(pool) for pool in self._idle.values())
+
+    def _checkout(self, key, timeout):
+        with self._lock:
+            pool = self._idle.get(key)
+            if pool:
+                return pool.pop(), True, self._epoch
+            epoch = self._epoch
+        scheme, host, port = key
+        if scheme == "https":
+            conn = http.client.HTTPSConnection(host, port, timeout=timeout,
+                                               context=_ai_ssl_context())
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        return conn, False, epoch
+
+    def _checkin(self, key, conn, epoch):
+        with self._lock:
+            if epoch == self._epoch:
+                pool = self._idle.setdefault(key, [])
+                if len(pool) < self.MAX_IDLE:
+                    pool.append(conn)
+                    return
+        conn.close()
+
+    def _open(self, req, scheme):
+        if not getattr(req, "_ai_keepalive", False):
+            return None          # not ours: let the stock handler take it
+        parts = urllib.parse.urlsplit(req.full_url)
+        if not parts.hostname:
+            raise urllib.error.URLError("no host given")
+        key = (scheme, parts.hostname, parts.port or (443 if scheme == "https" else 80))
+        timeout = req.timeout
+        if timeout is socket._GLOBAL_DEFAULT_TIMEOUT:
+            timeout = None
+        headers = dict(req.header_items())
+        for attempt in (0, 1):
+            conn, reused, epoch = self._checkout(key, timeout)
+            try:
+                if reused and conn.sock is not None:
+                    conn.sock.settimeout(timeout)
+                try:
+                    conn.request(req.get_method(), req.selector, body=req.data,
+                                 headers=headers)
+                except (BrokenPipeError, ConnectionResetError,
+                        ConnectionAbortedError, http.client.CannotSendRequest):
+                    raise
+                except OSError as exc:
+                    # Same shape as urllib's own handler for a failed send.
+                    raise urllib.error.URLError(exc) from None
+                response = conn.getresponse()
+                data = response.read()
+            except (http.client.RemoteDisconnected, http.client.CannotSendRequest,
+                    BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                conn.close()
+                # The server closed an idle keep-alive socket between requests.
+                # Nothing was processed, so one fresh connection is safe; a
+                # timeout is NOT retried - the server may still be generating.
+                if reused and attempt == 0:
+                    continue
+                raise
+            except BaseException:
+                conn.close()
+                raise
+            if response.will_close:
+                conn.close()
+            else:
+                self._checkin(key, conn, epoch)
+            result = urllib.response.addinfourl(io.BytesIO(data), response.headers,
+                                                req.full_url, response.status)
+            result.msg = response.reason
+            return result
+        raise urllib.error.URLError("AI connection closed")   # pragma: no cover
+
+    def http_open(self, req):
+        return self._open(req, "http")
+
+    def https_open(self, req):
+        return self._open(req, "https")
+
+
+_AI_KEEPALIVE = _KeepAliveAIHandler()
+_AI_LAN_KEEPALIVE = _KeepAliveAIHandler()
+NOPROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}), _AI_KEEPALIVE)
+
+
+class _NoLANRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # LAN mode sends credentials and comments only to the saved endpoint.
+        # Even a misconfigured gateway cannot redirect them to a public host.
+        return None
+
+
+LAN_NOPROXY = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoLANRedirect(), _AI_LAN_KEEPALIVE)
 
 # Rate limit comes from the provider preset: a hosted endpoint needs spacing,
 # a local Ollama does not. Read live so changing provider takes effect at once.
@@ -1620,14 +1766,21 @@ def _fatal_ai_error(code, detail):
     return code == 400 and bool(_AI_FATAL_RE.search(detail or ""))
 
 
-def _groq_chat(prompt_text, timeout=None, system=None, max_tokens=60, model=None):
+def _groq_chat(prompt_text, timeout=None, system=None, max_tokens=60, model=None,
+               cfg=None, _probe=False):
     # Try the good model first; fall back to the small one only if the big one
     # is unavailable (rate limit / decommissioned), so a bad key or a busy
     # endpoint degrades instead of failing outright.
     # `prompt_text` may be a plain string or an OpenAI content-block list, which
     # is how an image rides along on the vision call - both go straight into the
     # user message.
-    cfg = ai_cfg()
+    # `_probe` marks the health checks (session start, warm-up, the breaker's
+    # own re-check): they always reach the endpoint, everything else is turned
+    # away without a request while the shared breaker is open.
+    if not _probe and _ai_breaker["open"]:
+        raise AIEndpointCooling("AI endpoint is resting after failures: "
+                                + (_ai_breaker["reason"] or "not answering"))
+    cfg = ai_cfg() if cfg is None else cfg
     # venom_ai.json's "timeout" was ignored on the two call sites that matter -
     # generate_comment and _generate_context_comment pass no timeout, so every
     # comment used the 20s default no matter what the file said. A self-hosted
@@ -1680,17 +1833,33 @@ def _groq_chat(prompt_text, timeout=None, system=None, max_tokens=60, model=None
             body.update(sampling)
             req = urllib.request.Request(
                 url, data=json.dumps(body).encode("utf-8"), headers=headers)
+            req._ai_keepalive = True
+            started = time.time()
             try:
-                with NOPROXY.open(req, timeout=timeout) as resp:
+                opener = LAN_NOPROXY if aiconfig.get_server_mode(cfg) == "lan" else NOPROXY
+                with opener.open(req, timeout=timeout) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
-                return data["choices"][0]["message"]["content"]
+                content = data["choices"][0]["message"]["content"]
+                _ai_breaker_success(None if _probe == "warmup" else time.time() - started)
+                return content
             except urllib.error.HTTPError as e:
                 try:
                     detail = e.read().decode("utf-8", "replace")
                 except Exception:
                     detail = ""
+                finally:
+                    e.close()
                 last = RuntimeError(f"HTTP {e.code} on {mdl}: {detail[:200]}"
                                     if detail else f"HTTP {e.code} on {mdl}")
+                if e.code >= 500:
+                    # Overloaded, crashed or unreachable behind a proxy (502/
+                    # 503/504/524): the endpoint itself is the problem, and
+                    # the fallback model lives on the same server.
+                    # At session start a 5xx is a definite answer: open now
+                    # rather than letting every phone find out on its own.
+                    _ai_breaker_failure(last, http_code=e.code, force=_probe == "start")
+                    if _ai_breaker["open"] and not _probe:
+                        raise last
                 # No key, no credit, no quota: the fallback model shares the
                 # same key, so trying it just repeats the same 400.
                 if _fatal_ai_error(e.code, detail):
@@ -1704,8 +1873,14 @@ def _groq_chat(prompt_text, timeout=None, system=None, max_tokens=60, model=None
                         print("  [ai] !! this is a KEY/BILLING problem, not a "
                               "network one. Fix it in AI Settings - the AI is "
                               "off for this run.")
+                        report_error("AI_AUTH_FAILED", detail=f"HTTP {e.code} on {mdl}: {said}",
+                                     severity="error")
                     _ai_off[0] = True
                     raise last
+                if 400 <= e.code < 500 and e.code != 429 and not (
+                        e.code == 400 and _sampling_rejected(detail)):
+                    _ai_say_once(f"rejected-{e.code}", "AI_REQUEST_REJECTED",
+                                 f"HTTP {e.code} on {mdl}: {detail[:200]}")
                 # The MODEL is fine, the sampling params are not. Retry it as-is
                 # rather than dropping to the fallback model.
                 if (e.code == 400 and sampling and attempt == 0
@@ -1728,10 +1903,18 @@ def _groq_chat(prompt_text, timeout=None, system=None, max_tokens=60, model=None
                 break
             except Exception as e:
                 last = e
+                if _ai_transport_error(e):
+                    # A refused/unresolvable endpoint at session start is
+                    # down; a start-up TIMEOUT may just be a cold model
+                    # loading, so that one only counts like any other.
+                    _ai_breaker_failure(e, force=_probe == "start" and not _is_timeout(e))
+                    if _ai_breaker["open"] and not _probe:
+                        raise
                 break
     raise last if last else RuntimeError("AI: no model available")
 
-def _pollinations_get(prompt_text, timeout=35, system=None, max_tokens=40):
+def _pollinations_get(prompt_text, timeout=35, system=None, max_tokens=40,
+                      cfg=None):
     # The old plain-text GET (text.pollinations.ai/<prompt>) now answers 402
     # "Payment Required" for anonymous callers - Pollinations deprecated it.
     # The keyless POST /openai endpoint still works, so route through it and
@@ -1741,7 +1924,7 @@ def _pollinations_get(prompt_text, timeout=35, system=None, max_tokens=40):
     # call that generate_comment makes right after this, so we don't hammer the
     # same throttled IP twice.
     return _pollinations_post(prompt_text, timeout=timeout, system=system,
-                              max_tokens=max_tokens, tries=1)
+                              max_tokens=max_tokens, tries=1, cfg=cfg)
 
 # Pollinations does not fail with an HTTP error when the account is out of
 # credits - it answers 200 OK and puts the apology in message.content:
@@ -1760,7 +1943,11 @@ _POLL_DEAD_RE = re.compile(
 _poll_dead = [False]
 
 
-def _pollinations_post(prompt_text, timeout=20, system=None, max_tokens=60, tries=2):
+def _pollinations_post(prompt_text, timeout=20, system=None, max_tokens=60,
+                       tries=2, cfg=None):
+    cfg = ai_cfg() if cfg is None else cfg
+    if aiconfig.get_server_mode(cfg) == "lan":
+        raise RuntimeError("External AI fallback is disabled in LAN mode")
     if _poll_dead[0]:
         raise RuntimeError("Pollinations is out of credits for this key")
     # Keyless, free, OpenAI-shaped. Only text.pollinations.ai/openai still
@@ -1776,7 +1963,7 @@ def _pollinations_post(prompt_text, timeout=20, system=None, max_tokens=60, trie
     #     users. Please migrate to https://enter.pollinations.ai" for any keyed
     #     request, so a token MUST go here or it can never work.
     #   * without one -> the legacy anonymous host, one request per 15s.
-    token = str(_ai("pollinations_token", "") or "").strip() or \
+    token = str(cfg.get("pollinations_token", "") or "").strip() or \
         os.environ.get("POLLINATIONS_TOKEN", "").strip()
     if token:
         url = "https://gen.pollinations.ai/v1/chat/completions"
@@ -2671,7 +2858,7 @@ _STYLE_LEAK = (" register ", " caps ", " all caps ", " comparison ",
                " code-switch ", " punctuation ")
 
 
-def _good_styled_comment(out, words, style, ctx="", examples=()):
+def _good_styled_comment(out, words, style, ctx="", examples=(), feedback=None):
     """Gate for a sampled sarcastic-anger comment.
 
     Checks what the style actually promised: the length band it drew, the
@@ -2712,6 +2899,8 @@ def _good_styled_comment(out, words, style, ctx="", examples=()):
     if stray:
         print(f"  [ai] rejected (brings in '{stray}' - not in the post or the "
               f"examples): {out[:60]}")
+        if feedback is not None:
+            feedback.setdefault("avoid", []).append(str(stray).lower())
         return False
     # Talking about a profile photo is only wrong when the POST is not about
     # one. Plenty of posts are exactly that ("new pfp"), and rejecting those
@@ -2726,6 +2915,8 @@ def _good_styled_comment(out, words, style, ctx="", examples=()):
     if hit:
         print(f"  [ai] rejected (hard swearing '{hit.group(0)}' - gets the "
               f"comment pulled): {out[:60]}")
+        if feedback is not None:
+            feedback.setdefault("avoid", []).append(hit.group(0).lower())
         return False
     for meta in _STYLE_LEAK:
         if meta in low:
@@ -2760,8 +2951,42 @@ def comment_system_context(examples, tone=None, style=None):
             + tone_block(tone) + _CTX_SYSTEM_TAIL)
 
 
-def _good_context_comment(out, examples, ctx, style=None):
+def _note_avoid(feedback, out, keys):
+    """Record which of `out`'s words got it rejected, for the next attempt.
+
+    `keys` are capped forms (_word_key); the surface words the model actually
+    typed are what it needs to hear back, in the order it used them.
+    """
+    if feedback is None or not keys:
+        return
+    typed = [w for w in re.findall(r"[a-z0-9]+", str(out or "").lower())
+             if _word_key(w) in keys]
+    feedback.setdefault("avoid", []).extend(dict.fromkeys(typed or sorted(keys)))
+
+
+def _retry_avoid_line(words):
+    """Tell a retry exactly which words got the last attempt(s) rejected.
+
+    The retry used to resend the identical prompt, so the model mostly made
+    the identical choice: measured through the live endpoint on a two-example
+    post, all three styled attempts leaned on "sana"/"view"/"makabalik" and the
+    comment fell through to the plain reword path, ~4s of wasted calls each.
+    """
+    words = [w for w in dict.fromkeys(words) if w][:10]
+    if not words:
+        return ""
+    return ("\n\nYOUR LAST TRY WAS REJECTED for reusing these words: "
+            + ", ".join(f'"{w}"' for w in words)
+            + ". Write a different comment that contains NONE of them - not "
+              "even another form of them. Reply with only the comment.")
+
+
+def _good_context_comment(out, examples, ctx, style=None, feedback=None):
     """Quality gate for a context comment.
+
+    `feedback`, when given, collects the words a rejection was about under
+    "avoid", so the next attempt can be told to steer clear of them. The
+    verdict itself does not depend on it.
 
     _good_variation is the wrong test here - it rejects anything that does not
     mean what the example means, and meaning something NEW about the post is the
@@ -2783,7 +3008,7 @@ def _good_context_comment(out, examples, ctx, style=None):
         return False
     joined = " ".join(examples)
     if style:
-        return _good_styled_comment(out, words, style, ctx, examples)
+        return _good_styled_comment(out, words, style, ctx, examples, feedback=feedback)
     # _detect_lang is a marker-word count, and gamer slang is not in its list:
     # of "angas ng sukuna wallpaper" / "angas bangis tol" / "sheeesh iba talaga
     # tol kapg sukuna", it calls the last two ENGLISH. At comment length it is
@@ -2824,6 +3049,7 @@ def _good_context_comment(out, examples, ctx, style=None):
     if len(echoed) > 1:
         print(f"  [ai] rejected (leans on the example's words "
               f"{sorted(echoed)}): {out[:60]}")
+        _note_avoid(feedback, out, echoed)
         return False
     # A word that has had its allowance under this post is retired. This is
     # what actually stops one word riding into every comment.
@@ -2831,6 +3057,7 @@ def _good_context_comment(out, examples, ctx, style=None):
     if burnt:
         print(f"  [ai] rejected (word already used {WORD_USE_LIMIT}x under "
               f"this post: {sorted(burnt)}): {out[:60]}")
+        _note_avoid(feedback, out, burnt)
         return False
     if voice and not (out_content - voice):
         print(f"  [ai] rejected (says nothing the examples did not - it is "
@@ -3087,7 +3314,7 @@ def _spent_words(url=None):
 
 
 def _generate_context_comment(examples, ctx, retries=3, avoid_openings=None,
-                              tone=None):
+                              tone=None, cfg=None):
     """A comment about THIS post, typed in the examples' voice."""
     examples = [e for e in examples if e.strip()][:8]
     if not examples:
@@ -3182,16 +3409,29 @@ def _generate_context_comment(examples, ctx, retries=3, avoid_openings=None,
         + " Reply with only the comment, and nothing else."
     )
     max_tok = max(60, min(400, target * 6 + 60))
+    # Words earlier attempts were rejected for, in the order they came up.
+    # Each retry is told them by name, and the list only grows, so attempt 3
+    # cannot walk back into what sank attempt 1.
+    rejected_words = []
     for attempt in range(retries):
+        # Checked before taking a pacing slot: a phone must not queue behind
+        # the fleet only to learn the endpoint is resting.
+        if _ai_is_off():
+            return ""
         if not _ai_wait_slot():
             return ""
         try:
-            raw = _groq_chat(prompt_text, system=system_prompt,
-                             max_tokens=max_tok)
+            raw = _groq_chat(prompt_text + _retry_avoid_line(rejected_words),
+                             system=system_prompt, max_tokens=max_tok, cfg=cfg)
             out = sanitize_comment(raw, "", style=style)
-            if _good_context_comment(out, examples, ctx, style=style):
+            feedback = {}
+            if _good_context_comment(out, examples, ctx, style=style,
+                                     feedback=feedback):
                 _claim_phrases(out)
                 return out
+            for word in feedback.get("avoid", ()):
+                if word not in rejected_words:
+                    rejected_words.append(word)
             continue
         except Exception as e:
             print(f"  [ai] context attempt {attempt+1} failed: {e}")
@@ -3219,6 +3459,8 @@ def comment_examples_as_context(example):
 
 def generate_comment(example, retries=3, avoid_openings=None, tone=None,
                      ctx="", examples=None):
+    cfg = ai_cfg()
+    lan_only = aiconfig.get_server_mode(cfg) == "lan"
     example = example.strip()
     # `ctx` is what the post actually is, read once per link by post_context().
     # With it the job changes completely: the examples stop being the sentence
@@ -3230,9 +3472,13 @@ def generate_comment(example, retries=3, avoid_openings=None, tone=None,
         out = _generate_context_comment(examples or [example], ctx,
                                         retries=retries,
                                         avoid_openings=avoid_openings,
-                                        tone=tone)
+                                        tone=tone, cfg=cfg)
         if out:
             return out
+        if _ai_is_off():
+            # The endpoint is resting (or off): no style retry and no reword
+            # pass - the caller's offline wordings take over immediately.
+            return example
         # A style that could not be satisfied must not cost us the POST. Drop
         # the style, keep the post: an on-topic comment in a plainer voice
         # beats a perfectly-styled reword of an example written under some
@@ -3243,7 +3489,7 @@ def generate_comment(example, retries=3, avoid_openings=None, tone=None,
             out = _generate_context_comment(examples or [example], ctx,
                                             retries=2,
                                             avoid_openings=avoid_openings,
-                                            tone="annoyed")
+                                            tone="annoyed", cfg=cfg)
             if out:
                 return out
         print("  [ai] context comment failed - rewording the example instead")
@@ -3317,18 +3563,19 @@ def generate_comment(example, retries=3, avoid_openings=None, tone=None,
     )
 
     for attempt in range(retries):
-        if not _ai_wait_slot():
-            return example          # PURGE: don't start a fresh AI call
         # A bad key or an empty balance answers every phone identically, so
         # once _groq_chat has said so there is nothing left to retry. Without
         # this the fleet still burned retries x providers x comments x 19
         # threads against an endpoint that had already given its final answer.
+        # Checked BEFORE the pacing slot, so a resting endpoint costs no wait.
         if _ai_is_off():
             return example
-        if GROQ_API_KEY:
+        if not _ai_wait_slot():
+            return example          # PURGE: don't start a fresh AI call
+        if lan_only or str(cfg.get("api_key") or "").strip():
             try:
                 raw = _groq_chat(prompt_text, system=system_prompt,
-                                 max_tokens=max_tok)
+                                 max_tokens=max_tok, cfg=cfg)
                 out = sanitize_comment(raw, example)
                 if _good_variation(out, example):
                     return out
@@ -3338,9 +3585,11 @@ def generate_comment(example, retries=3, avoid_openings=None, tone=None,
                 continue
             except Exception as e_groq:
                 print(f"  [ai] Groq attempt {attempt+1} failed: {e_groq}")
+        if lan_only:
+            continue
         try:
             raw = _pollinations_get(prompt_text, system=system_prompt,
-                                    max_tokens=max_tok)
+                                    max_tokens=max_tok, cfg=cfg)
             out = sanitize_comment(raw, example)
             if _good_variation(out, example):
                 return out
@@ -3348,7 +3597,7 @@ def generate_comment(example, retries=3, avoid_openings=None, tone=None,
             print(f"  [ai] GET attempt {attempt+1} failed: {e_get}")
         try:
             raw = _pollinations_post(prompt_text, system=system_prompt,
-                                     max_tokens=max_tok)
+                                     max_tokens=max_tok, cfg=cfg)
             out = sanitize_comment(raw, example)
             if _good_variation(out, example):
                 return out
@@ -3359,24 +3608,30 @@ def generate_comment(example, retries=3, avoid_openings=None, tone=None,
     return example
 
 def ai_reply(prompt_text, system=None, max_tokens=90, retries=2):
+    cfg = ai_cfg()
+    lan_only = aiconfig.get_server_mode(cfg) == "lan"
     for _ in range(retries):
         if not _ai_wait_slot():
             return ""               # PURGE: don't start a fresh AI call
-        if GROQ_API_KEY:
+        if lan_only or str(cfg.get("api_key") or "").strip():
             try:
-                r = _groq_chat(prompt_text, system=system, max_tokens=max_tokens)
+                r = _groq_chat(prompt_text, system=system, max_tokens=max_tokens,
+                               cfg=cfg)
                 if r and r.strip():
                     return r
             except Exception:
                 pass
+        if lan_only:
+            continue
         try:
-            r = _pollinations_get(prompt_text, system=system)
+            r = _pollinations_get(prompt_text, system=system, cfg=cfg)
             if r and r.strip():
                 return r
         except Exception:
             pass
         try:
-            r = _pollinations_post(prompt_text, system=system, max_tokens=max_tokens)
+            r = _pollinations_post(prompt_text, system=system, max_tokens=max_tokens,
+                                   cfg=cfg)
             if r and r.strip():
                 return r
         except Exception:
@@ -3384,13 +3639,30 @@ def ai_reply(prompt_text, system=None, max_tokens=90, retries=2):
     return ""
 
 def start_llama():
-    if GROQ_API_KEY:
+    cfg = ai_cfg()
+    lan_only = aiconfig.get_server_mode(cfg) == "lan"
+    if lan_only or str(cfg.get("api_key") or "").strip():
+        if lan_only:
+            print("  [ai] Checking LAN AI gateway...")
+            try:
+                _groq_chat("hi", timeout=15, cfg=cfg, _probe="start")
+                print("  [ai] LAN AI gateway ready.")
+                return True
+            except Exception as e:
+                print(f"  [ai] LAN gateway check failed ({e}); external fallback is disabled.")
+                return False
         print("  [ai] Checking Groq AI (free tier)...")
         try:
-            _groq_chat("hi", timeout=15)
+            _groq_chat("hi", timeout=15, cfg=cfg, _probe="start")
             print("  [ai] Groq AI ready.")
             return True
         except Exception as e:
+            if ai_endpoint_open():
+                # Phones skip every AI path while the breaker is open, so a
+                # healthy Pollinations would only make this check lie.
+                print(f"  [ai] AI endpoint is down ({e}); comments use offline "
+                      f"wordings until it answers again.")
+                return False
             print(f"  [ai] Groq check failed ({e}); falling back to Pollinations...")
     import urllib.parse
     print("  [ai] Checking Pollinations AI (plain-text endpoint)...")
@@ -3405,7 +3677,7 @@ def start_llama():
     except Exception as e:
         print(f"  [ai] GET endpoint failed ({e}), trying POST fallback...")
         try:
-            _pollinations_post("hi", timeout=15)
+            _pollinations_post("hi", timeout=15, cfg=cfg)
             print("  [ai] Pollinations POST fallback ready.")
             return True
         except Exception as e2:
@@ -3628,6 +3900,161 @@ _ai_off = [False]            # hard off: a key/billing answer never self-heals
 _ai_cold_until = [0.0]
 AI_COOLDOWN = 120.0
 
+# ── Shared AI endpoint breaker ────────────────────────────────────────────
+# A stalled endpoint used to cost EVERY phone the full timeout on EVERY try:
+# three context attempts, two style retries and three rewording attempts, each
+# up to the 90s timeout - about ten minutes per comment per phone - and every
+# abandoned request stayed queued on the server, deepening its backlog (590
+# requests in flight on a gateway with 18 live clients, measured). One breaker
+# now decides for the whole fleet. Two transport failures in a row (timeout,
+# refused/reset connection, HTTP 5xx) open it; phones then use the offline
+# wordings at once instead of queueing, and ONE background probe decides when
+# the AI is back. Any success closes it. Cleared at every session start.
+AI_BREAKER_THRESHOLD = 2
+AI_PROBE_DELAYS = (10.0, 20.0, 40.0, 60.0)   # then every 60s while open
+AI_PROBE_TIMEOUT = 60.0
+AI_SLOW_SECONDS = 25.0
+_ai_breaker_lock = threading.Lock()
+_ai_breaker = {"failures": 0, "open": False, "since": 0.0, "reason": "",
+               "generation": 0, "probing": False, "said": set()}
+
+
+class AIEndpointCooling(RuntimeError):
+    """Raised without sending anything while the shared AI breaker is open."""
+
+
+def ai_endpoint_open():
+    """True while the fleet is skipping the AI endpoint after failures."""
+    return bool(_ai_breaker["open"])
+
+
+def _is_timeout(exc):
+    if isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError):
+        exc = exc.reason
+    return isinstance(exc, (TimeoutError, socket.timeout)) or "timed out" in str(exc).lower()
+
+
+def _ai_transport_error(exc):
+    """True when a failure says the endpoint itself is down or stalled."""
+    if isinstance(exc, AIEndpointCooling):
+        return False
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code >= 500
+    return isinstance(exc, (OSError, http.client.HTTPException))
+
+
+def _ai_say_once(key, code, detail="", severity="warning"):
+    """One diagnostic per outage and kind - never one per phone."""
+    with _ai_breaker_lock:
+        if key in _ai_breaker["said"]:
+            return
+        _ai_breaker["said"].add(key)
+    try:
+        report_error(code, detail=detail, severity=severity)
+    except Exception:
+        pass
+
+
+def _ai_breaker_success(elapsed=None):
+    with _ai_breaker_lock:
+        was_open = _ai_breaker["open"]
+        down_for = time.time() - _ai_breaker["since"] if was_open else 0.0
+        _ai_breaker["failures"] = 0
+        _ai_breaker["open"] = False
+        _ai_breaker["reason"] = ""
+        if was_open:
+            _ai_breaker["said"].discard("outage")   # a later outage is news
+    try:
+        if was_open:
+            took = f" in {elapsed:.1f}s" if elapsed is not None else ""
+            print(f"  [ai] endpoint answering again{took} after {down_for:.0f}s "
+                  f"- AI comments resume")
+            report_error("AI_RECOVERED", severity="info",
+                         detail=f"Answered{took} after {down_for:.0f}s of failures.")
+        if elapsed is not None and elapsed >= AI_SLOW_SECONDS:
+            _ai_say_once("slow", "AI_SLOW",
+                         f"A reply took {elapsed:.0f}s; a healthy server answers in a few seconds.")
+    except Exception:
+        pass
+
+
+def _ai_breaker_failure(exc, http_code=None, force=False):
+    """Count one endpoint failure; open the breaker once it is clearly down."""
+    if http_code is not None:
+        code = "AI_SERVER_ERROR"
+    elif _is_timeout(exc):
+        code = "AI_TIMEOUT"
+    else:
+        code = "AI_UNREACHABLE"
+    with _ai_breaker_lock:
+        _ai_breaker["failures"] += 1
+        opening = not _ai_breaker["open"] and (
+            force or _ai_breaker["failures"] >= AI_BREAKER_THRESHOLD)
+        if not opening:
+            return
+        _ai_breaker["open"] = True
+        _ai_breaker["since"] = time.time()
+        reason = f"HTTP {http_code}" if http_code is not None else type(exc).__name__
+        _ai_breaker["reason"] = _diagnostic_text(f"{reason}: {exc}", 180)
+        start_probe = not _ai_breaker["probing"]
+        if start_probe:
+            _ai_breaker["probing"] = True
+        generation = _ai_breaker["generation"]
+        say = "outage" not in _ai_breaker["said"]
+        _ai_breaker["said"].add("outage")
+        reason = _ai_breaker["reason"]
+    print(f"  [ai] endpoint failing ({reason}) - phones use offline wordings "
+          f"while it is re-checked in the background")
+    if say:
+        try:
+            report_error(code, detail=reason, severity="warning")
+        except Exception:
+            pass
+    if start_probe:
+        _start_ai_probe(generation)
+
+
+def _start_ai_probe(generation):
+    threading.Thread(target=_ai_probe_loop, args=(generation,),
+                     name="ai-endpoint-probe", daemon=True).start()
+
+
+def _ai_probe_loop(generation):
+    """Re-check a failing endpoint with one tiny request - never from a phone."""
+    def stale():
+        return (_ai_breaker["generation"] != generation or not _ai_breaker["open"]
+                or _ai_off[0])
+    try:
+        attempt = 0
+        while True:
+            delay = AI_PROBE_DELAYS[min(attempt, len(AI_PROBE_DELAYS) - 1)]
+            attempt += 1
+            deadline = time.time() + delay
+            while time.time() < deadline:
+                if stale():
+                    return
+                time.sleep(min(0.5, max(0.0, deadline - time.time())))
+            if stale():
+                return
+            try:
+                cfg = ai_cfg()
+                try:
+                    limit = float(cfg.get("timeout") or AI_PROBE_TIMEOUT)
+                except (TypeError, ValueError):
+                    limit = AI_PROBE_TIMEOUT
+                _groq_chat("hi", timeout=min(AI_PROBE_TIMEOUT, limit),
+                           system="Reply with one word.", max_tokens=4, cfg=cfg,
+                           _probe="recheck")
+                return               # the success already closed the breaker
+            except Exception as exc:
+                nxt = AI_PROBE_DELAYS[min(attempt, len(AI_PROBE_DELAYS) - 1)]
+                print(f"  [ai] endpoint still failing ({type(exc).__name__}) - "
+                      f"next check in {nxt:.0f}s")
+    finally:
+        with _ai_breaker_lock:
+            if _ai_breaker["generation"] == generation:
+                _ai_breaker["probing"] = False
+
 
 def _pool(url=None):
     """This link's used-wording sets. Call with _used_lock held."""
@@ -3643,22 +4070,46 @@ def _pool(url=None):
 
 
 def _ai_is_off():
-    """True while the AI must not be called: hard off, or cooling down."""
-    return _ai_off[0] or time.time() < _ai_cold_until[0]
+    """True while the AI must not be called: hard off, cooling down, or the
+    shared breaker is open because the endpoint stopped answering."""
+    return _ai_off[0] or time.time() < _ai_cold_until[0] or bool(_ai_breaker["open"])
+
+
+def reset_ai_connection_state():
+    """Forget endpoint failures/pacing after an idle settings switch.
+
+    This does not generate a warm-up request or clear per-post comment history.
+    The GUI calls it only while no commenting session is running.
+    """
+    # A previous session's background probe can still hold _ai_http_lock
+    # during a slow request. Settings changes run on the GUI thread and must
+    # not wait for that network operation to finish.
+    with _used_lock:
+        _ai_fails[0] = 0
+        _ai_off[0] = False
+        _ai_cold_until[0] = 0.0
+        _ai_fatal_said[0] = False
+        _poll_dead[0] = False
+        _no_sampling.clear()
+    _poll_last_call[0] = 0.0
+    with _ai_slot_lock:
+        _ai_next_slot[0] = 0.0
+    with _ai_breaker_lock:
+        _ai_breaker.update(failures=0, open=False, since=0.0, reason="",
+                           probing=False, said=set())
+        # A probe left over from the previous session sees the new generation
+        # and exits without touching this one.
+        _ai_breaker["generation"] = _ai_breaker.get("generation", 0) + 1
+    # A changed endpoint or key must never ride an old socket.
+    _AI_KEEPALIVE.reset()
+    _AI_LAN_KEEPALIVE.reset()
+
 
 def reset_comment_pool():
     with _used_lock:
         _pool_by_link.clear()
         _example_turn[0] = 0
-        _ai_fails[0] = 0
-        _ai_off[0] = False
-        _ai_cold_until[0] = 0.0
-    # Re-test Pollinations on a new run: the user may have topped the token up.
-    _poll_dead[0] = False
-    # Say it again on the next run. The GUI stays open across runs, so without
-    # this a still-dead key reports itself once and every later run goes quiet
-    # for no visible reason - which is the confusion this message exists to end.
-    _ai_fatal_said[0] = False
+    reset_ai_connection_state()
     # A new run means new links, and an edited post gets read again.
     reset_post_context()
     # FIX 1b: wake the endpoint up BEFORE the phones need it. A cold
@@ -3673,7 +4124,10 @@ def warm_ai_endpoint():
     """One throwaway generation so the model is resident before the run needs it."""
     try:
         t0 = time.time()
-        _groq_chat("hi", timeout=180, system="Reply with one word.", max_tokens=4)
+        # A cold load legitimately takes a minute, so the warm-up is never
+        # judged as "slow" - only real comment replies are.
+        _groq_chat("hi", timeout=180, system="Reply with one word.", max_tokens=4,
+                   _probe="warmup")
         print(f"  [ai] endpoint warm in {time.time() - t0:.0f}s")
     except Exception as e:
         print(f"  [ai] warm-up failed ({type(e).__name__}: {e}) - "
@@ -3761,6 +4215,67 @@ def unique_comment(example="", tone=None, ctx=""):
     if text:
         _claim_words(text)
     return text
+
+
+def prefetch_comment(tgt):
+    """Start composing a link's comment while the phone is still opening it.
+
+    Opening a post takes the phone several seconds; the comment used to be
+    composed only AFTER that, so every AI round trip (and every quality-gate
+    retry) was added on top. Composing alongside the open hides it. One
+    pending comment per phone thread: retries of the same open reuse it, so a
+    flaky open does not burn extra wordings.
+    """
+    try:
+        if not tgt.get("do_comment"):
+            return None
+        url = str(tgt.get("url") or "")
+        example = str(tgt.get("comment") or "")
+    except AttributeError:
+        return None
+    if not url:
+        return None
+    pending = getattr(_tls, "prefetch", None)
+    if pending and pending[0] == url and pending[1] == example:
+        return pending[2]
+    future = concurrent.futures.Future()
+
+    def work():
+        if not future.set_running_or_notify_cancel():
+            return
+        set_current_post_url(url)        # the per-post wording pool
+        try:
+            ctx = comment_examples_as_context(example) if example.strip() else ""
+            future.set_result(unique_comment(example, ctx=ctx))
+        except BaseException as exc:
+            future.set_exception(exc)
+
+    _tls.prefetch = (url, example, future)
+    threading.Thread(target=work, name="comment-prefetch", daemon=True).start()
+    return future
+
+
+def take_prefetched_comment(url, example):
+    """The prefetched wording for this link, or None to compose it inline.
+
+    Returns "" when Abort is pressed while waiting; the caller checks
+    stop_requested() before treating an empty result as anything else.
+    """
+    pending = getattr(_tls, "prefetch", None)
+    if not pending or pending[0] != url or pending[1] != str(example or ""):
+        return None
+    _tls.prefetch = None
+    future = pending[2]
+    while True:
+        try:
+            return future.result(timeout=0.25)
+        except concurrent.futures.TimeoutError:
+            if stop_requested():
+                return ""
+        except Exception as exc:
+            print(f"  [ai] prefetched comment failed ({type(exc).__name__}: {exc}) "
+                  f"- composing it now")
+            return None
 
 
 def _unique_comment_inner(example="", tone=None, ctx=""):
@@ -4111,7 +4626,14 @@ def run(args, serial=None, timeout=60):
                            encoding="utf-8", errors="replace")
         return p.returncode, (p.stdout or ""), (p.stderr or "")
     except subprocess.TimeoutExpired:
+        if getattr(_link_check, "active", False):
+            return 1, "", "timeout"        # heal_hung_link's own probe
         report_error("ADB_TIMEOUT", serial, detail=f"command={args[0] if args else '(empty)'}")
+        # The command is NOT retried: a tap that timed out may still have
+        # landed, and a Send must never go twice. Only the link is repaired,
+        # so the caller's own next step reaches the phone again.
+        if serial and args and args[0] in ("shell", "exec-out"):
+            heal_hung_link(serial)
         return 1, "", "timeout"
     except OSError as e:
         report_error("ADB_UNAVAILABLE", serial, exc=e)
@@ -4119,6 +4641,74 @@ def run(args, serial=None, timeout=60):
     except UnicodeError as e:
         print(f"  [adb] output decode failed: {e}")
         return 1, "", "decode-error"
+
+
+# A phone's USB link can hang while ADB still lists the phone as "device".
+# Measured on a Redmi 9 phone box (cascaded USB 2.0 hubs, scrcpy mirroring every
+# phone): two phones on one sub-hub stopped answering at the same moment -
+# `adb shell echo ok` timed out on both for 7+ minutes, with no USB reset in the
+# kernel log, while `adb devices` kept saying "device". wait_online() only
+# repairs phones that are NOT "device", so nothing ever looked wrong: every
+# command ran into its timeout, again and again, and the phone sat there doing
+# nothing for the rest of the run. `adb -s <serial> reconnect` healed both at
+# once - the shell answered within a second, and the run carried on.
+HUNG_LINK_PROBE = 5.0          # an `echo` answers in ~40 ms on a healthy link
+HUNG_LINK_RETRY = 30.0         # at most one reconnect per phone per 30 s
+HUNG_LINK_RECOVER = 15.0       # how long a reconnected phone gets to answer
+_link_healed_at = {}
+_link_heal_lock = threading.Lock()
+_link_check = threading.local()     # set while heal_hung_link() runs
+
+
+def _link_answers(serial):
+    rc, out, _ = run(["shell", "echo", "ok"], serial=serial,
+                     timeout=HUNG_LINK_PROBE)
+    return rc == 0 and "ok" in (out or "")
+
+
+def heal_hung_link(serial):
+    """Reconnect a listed phone whose USB link stopped answering.
+
+    Only a phone ADB lists as "device" can have a hung link - a missing,
+    offline or unauthorized phone is wait_online()'s job. It checks first: a
+    slow command on a healthy phone is not a hung link, and then nothing is
+    touched. Only a phone that cannot even echo within HUNG_LINK_PROBE seconds
+    gets `adb reconnect` - the same as unplugging and replugging that one
+    phone. Its USB-internet tunnel, if any, is restored by the tunnel monitor
+    on its next pass. Returns True when the phone answers.
+    """
+    if not serial or stop_requested() or getattr(_link_check, "active", False):
+        return False
+    _link_check.active = True
+    try:
+        if device_state(serial) != "device":
+            return False
+        if _link_answers(serial):
+            return True
+        now = time.time()
+        with _link_heal_lock:
+            if now - _link_healed_at.get(serial, float("-inf")) < HUNG_LINK_RETRY:
+                return False
+            _link_healed_at[serial] = now
+        print(f"  [adb] {serial} is listed but stopped answering (hung USB "
+              f"link) - reconnecting it")
+        dbg(serial, "usb-link-hung", "reconnecting")
+        run(["reconnect"], serial=serial, timeout=15)
+        deadline = time.time() + HUNG_LINK_RECOVER
+        while time.time() < deadline:
+            if stop_requested():
+                return False
+            if _link_answers(serial):
+                print(f"  [adb] {serial} answers again after the reconnect.")
+                # MIUI raises "Use USB for" on every (re)connect, a moment later.
+                time.sleep(1.5)
+                dismiss_system_popup(serial)
+                return True
+            time.sleep(1.0)
+        print(f"  [adb] {serial} still not answering - check its cable and hub.")
+        return False
+    finally:
+        _link_check.active = False
 
 def list_devices():
     _, out, _ = run(["devices"])
@@ -4134,18 +4724,33 @@ def list_devices():
             devices[serial] = state or "unknown"
     return devices
 
+_RECOVERABLE_STATES = ("offline", "unknown")
+
+
 def ensure_online():
+    """Device list after trying to bring offline phones back.
+
+    Only offline/unknown phones can be recovered from the PC. An UNAUTHORIZED
+    phone waits for its owner to accept the debugging prompt, yet it used to
+    trigger up to three ADB server restarts on every rescan and every workspace
+    Start - each one disconnecting every other phone and, with USB internet on,
+    cutting every phone's internet just as the run began.
+    """
     devices = list_devices()
     for attempt in range(1, RECOVER_RETRIES + 1):
-        bad = {s: st for s, st in devices.items()
-               if st in ("offline", "unauthorized", "unknown")}
+        bad = {s: st for s, st in devices.items() if st in _RECOVERABLE_STATES}
         if not bad:
             break
         print(f"[recover] attempt {attempt}: {len(bad)} phone(s) not ready, trying to recover...")
         run(["reconnect", "offline"])
         time.sleep(2)
         devices = list_devices()
-        if any(st in ("offline", "unauthorized", "unknown") for st in devices.values()):
+        if any(st in _RECOVERABLE_STATES for st in devices.values()):
+            if usb_internet_active():
+                # The USB internet tunnels live inside the ADB server.
+                print("[recover] not restarting ADB while USB internet is on - "
+                      "every phone would lose its connection.")
+                break
             run(["kill-server"])
             run(["start-server"])
             time.sleep(3)
@@ -4171,16 +4776,24 @@ _FB_WEB_HOST_RE = re.compile(r"(?:^|\.)facebook\.com$", re.I)
 # Facebook Gaming's short host and is how most game LIVE links are shared.
 _FB_SHORT_HOSTS = {"fb.watch", "www.fb.watch", "fb.me", "www.fb.me",
                    "fb.gg", "www.fb.gg"}
+# Facebook's own alias domain. Measured 2026-11-18: fb.com/<path> and
+# www.fb.com/<path> answer 301 to www.facebook.com/<the same path>, so they
+# are rewritten locally instead of being rejected as "not Facebook".
+_FB_ALIAS_HOSTS = {"fb.com", "www.fb.com"}
 _FB_TRACKING_KEYS = {
     "fbclid", "mibextid", "sfnsn", "rdid", "extid", "ref", "refid",
     "refsrc", "paipv", "eav", "locale", "acontext", "app", "app_id",
     "notif_id", "notif_t", "hc_ref", "__cft__", "__tn__", "_rdr",
+    # Added by Facebook's own share redirects (seen 2026-11-18 on /share/v/
+    # and /reel/ answers): "?rdid=..&share_url=.." and "?extid=reels&wtsid=..".
+    "share_url", "wtsid",
 }
 
 
 def _facebook_host(host):
     host = str(host or "").lower().rstrip(".")
-    return bool(_FB_WEB_HOST_RE.search(host) or host in _FB_SHORT_HOSTS)
+    return bool(_FB_WEB_HOST_RE.search(host) or host in _FB_SHORT_HOSTS
+                or host in _FB_ALIAS_HOSTS)
 
 
 def _url_from_pasted_text(raw):
@@ -4206,7 +4819,7 @@ def _url_from_pasted_text(raw):
     pattern = (
         r"(?i)(?<![\w.@/:-])(?:(?:facebook|fb)://[^\s<>]+|"
         r"(?:https?://|//)?(?:[a-z0-9-]+\.)*facebook\.com(?:[/?#][^\s<>]*)?|"
-        r"(?:https?://|//)?(?:www\.)?(?:fb\.watch|fb\.me|fb\.gg)"
+        r"(?:https?://|//)?(?:www\.)?(?:fb\.watch|fb\.me|fb\.gg|fb\.com)"
         r"(?:[/?#][^\s<>]*)?)(?![\w.@:-])")
     m = re.search(pattern, text)
     if m:
@@ -4520,6 +5133,9 @@ def safe_dump(dev):
             xml = dev.dump_hierarchy()
         except Exception:
             if serial:
+                # A listed phone whose link hung looks "online" to
+                # wait_online(); check it can still answer, reconnect if not.
+                heal_hung_link(serial)
                 wait_online(serial)
             else:
                 time.sleep(1.0)
@@ -4532,6 +5148,10 @@ def safe_dump(dev):
             return xml                     # got the Facebook window
         if not serial or not fb_foreground(serial):
             return xml                     # can't verify, or FB really isn't up
+        # A pop-up that never goes away by itself ("Use USB for") would make
+        # the wait below run out every time: close it and read again.
+        if dismiss_system_popup(serial):
+            continue
         if attempt == 0:
             print("    [dump] got the system window instead of Facebook - "
                   "waiting for Facebook to take input focus")
@@ -4588,6 +5208,24 @@ _ERROR_HELP = {
                                 "Check storage and installation prompts, or install Facebook Lite manually."),
     "AI_UNAVAILABLE": ("The AI provider could not be reached.",
                        "Check the provider in AI settings; comments will use your example wordings as a fallback."),
+    "AI_TIMEOUT": ("The AI server did not answer in time.",
+                   "Phones now use your example wordings and the server is re-checked in the "
+                   "background. If this repeats, the server is overloaded or running without its GPU."),
+    "AI_UNREACHABLE": ("The AI server could not be reached.",
+                       "Check the AI address, this computer's internet connection and that the server "
+                       "is running. Phones use your example wordings until it answers again."),
+    "AI_SERVER_ERROR": ("The AI server returned a server error.",
+                        "The server is busy, restarting or misconfigured. Phones use your example "
+                        "wordings and AI comments resume automatically when it recovers."),
+    "AI_SLOW": ("The AI server is answering slowly.",
+                "Comments are delayed while it catches up. Check the server's load and that its "
+                "GPU is in use; a healthy server answers in a few seconds."),
+    "AI_RECOVERED": ("The AI server is answering again.",
+                     "AI-written comments have resumed."),
+    "AI_AUTH_FAILED": ("The AI server rejected the API key.",
+                       "Enter the correct key in AI settings. The AI is off for this session."),
+    "AI_REQUEST_REJECTED": ("The AI server rejected the comment request.",
+                            "Check the model name and address in AI settings."),
     "ADB_TIMEOUT": ("An Android device command timed out.",
                     "Check the phone and USB connection; reconnect if it remains unresponsive."),
     "ADB_UNAVAILABLE": ("Android platform tools could not start.",
@@ -4596,8 +5234,20 @@ _ERROR_HELP = {
                            "Open the link manually with the same account; check access, availability and connection."),
     "SHARE_UNRESOLVED": ("The shared link could not be resolved on this computer.",
                          "The original link will still be tried on the phone; if it fails, copy the content's direct permalink from Facebook."),
+    "LINK_NOT_SINGLE_CONTENT": ("This link does not point to a single post, reel, video or photo.",
+                                "It will still be tried, but comments need one post: open it in Facebook, "
+                                "tap Share > Copy link, and paste that link instead."),
+    "LINK_NOT_COMMENTABLE": ("Stories take private replies, not public comments, so this link was skipped.",
+                             "Paste the link of a post, reel or video instead."),
     "TARGET_NOT_VERIFIED": ("The requested post view could not be verified.",
-                            "Check the phone is on the intended content and has access; this link was skipped."),
+                            "Check the phone is on the intended content and has access; this link was skipped. "
+                            "The phone's screen is saved in the debug folder."),
+    "PHONE_NO_INTERNET": ("The phone says its connection has no internet.",
+                          "Check this phone's Wi-Fi or mobile data and the router; the post is retried "
+                          "as soon as the connection returns."),
+    "USB_VPN_STALE_STOPPED": ("Turned off a leftover USB internet VPN that had nothing behind it.",
+                              "The phone is back on its own Wi-Fi. Start USB internet again if you "
+                              "want it to use this computer's connection."),
     "COMMENT_EMPTY": ("There is no comment text to enter.",
                       "Add an example comment for this link."),
     "COMMENT_NO_BOX": ("A comment composer could not be found.",
@@ -4911,6 +5561,7 @@ def safe_window_size(dev):
             return sz
         except Exception:
             if serial:
+                heal_hung_link(serial)
                 wait_online(serial)
             else:
                 time.sleep(2)
@@ -4924,6 +5575,106 @@ def forget_window_size(serial=None):
             _wsize_cache.pop(serial, None)
         else:
             _wsize_cache.clear()
+    with _density_lock:
+        if serial:
+            _density_cache.pop(serial, None)
+            _density_retry_at.pop(serial, None)
+        else:
+            _density_cache.clear()
+            _density_retry_at.clear()
+
+
+# ── Screen density ─────────────────────────────────────────────────────────
+# Every size limit in the screen detectors (button widths and heights, row
+# gaps, band tolerances) is in PIXELS, measured on the fleet's 720-px phones.
+# Facebook Lite lays its screens out in dp, so one control is bigger in pixels
+# on a denser screen. The reel rail's gap proves it: 144 px on the itel
+# (720x1612), 126 px on the TECNO KM4 (720x1600), 198 px on a Redmi 9
+# (M2004J19C, 1080x2340, density 440) - 72 dp on every one of them.
+#
+# On that Redmi phone box the rail buttons measured 148x176 px, just past the
+# 140x175 limit, so the reel player was never recognised: every reel and video
+# link "would not open" and was force-stopped and reopened until it was given
+# up, while posts (found by text) still worked. The account switcher's chevron
+# (35-90 px) and every other shape test had the same ceiling.
+#
+# So each detector converts its limits with px(): the pixel size a control
+# measured on the fleet has on THIS screen. The fleet's phones draw 1.75-2.0
+# px per dp, and on them px(n) == n exactly - the limits there are untouched.
+REF_PX_PER_DP = 2.0
+_density_cache = {}
+_density_lock = threading.Lock()
+
+
+def _read_px_per_dp(dev):
+    """Pixels per dp as the phone reports them, or None.
+
+    uiautomator2 reports the screen in pixels AND in dp (`displaySizeDpX`), so
+    a live phone answers exactly. A saved dump or a test double cannot.
+    """
+    try:
+        if not isinstance(dev, u2.Device):
+            return None
+        info = dev.info or {}
+        dp_width = float(info.get("displaySizeDpX") or 0)
+        px_width = float(info.get("displayWidth") or 0)
+        if dp_width > 0 and px_width > 0:
+            return px_width / dp_width
+    except Exception:
+        pass
+    return None
+
+
+DENSITY_RETRY = 30.0           # after a failed read, judge by the screen meanwhile
+_density_retry_at = {}
+
+
+def px_per_dp(dev):
+    """Pixels per dp of this phone's screen (cached per phone)."""
+    serial = getattr(dev, "serial", None)
+    if serial:
+        with _density_lock:
+            hit = _density_cache.get(serial)
+            retry_at = _density_retry_at.get(serial, 0.0)
+        if hit:
+            return hit
+    else:
+        retry_at = 0.0
+    if time.time() >= retry_at:
+        value = _read_px_per_dp(dev)
+        if value is not None and 1.0 <= value <= 6.0:
+            if serial:
+                with _density_lock:
+                    _density_cache[serial] = value
+            return value
+        if serial and isinstance(dev, u2.Device):
+            # The phone was asked and could not say. Every screen check calls
+            # this, so do not ask again on each one while uiautomator recovers.
+            with _density_lock:
+                _density_retry_at[serial] = time.time() + DENSITY_RETRY
+    # Nothing to ask (a saved dump, a test double): phones are about 360-410
+    # dp across their SHORT side, so judge by that - 720 px reads as 2.0, the
+    # fleet itself, in portrait and in landscape (1600x720) alike.
+    try:
+        short_side = float(min(safe_window_size(dev)[:2]))
+    except Exception:
+        return REF_PX_PER_DP
+    return max(1.0, short_side / 360.0)
+
+
+def dp_scale(dev):
+    """How many times bigger, in pixels, this screen draws the controls than
+    the 720-px phones the limits were measured on. Never below 1, so the
+    fleet's own phones keep exactly the limits they were tuned with."""
+    return max(1.0, px_per_dp(dev) / REF_PX_PER_DP)
+
+
+def _scaler(dev):
+    """px(n): a size of n pixels on the fleet's phones, on this screen."""
+    k = dp_scale(dev)
+    if k <= 1.0:
+        return lambda n: n
+    return lambda n: int(round(n * k))
 
 def poll_until(check, timeout, interval=0.4):
     deadline = time.time() + timeout
@@ -4987,6 +5738,38 @@ def fb_has_focus(serial):
     for line in out.splitlines():
         if "mCurrentFocus" in line:
             return FB_PACKAGE in line
+    return False
+
+
+# System pop-ups that land on top of Facebook Lite and are safe to close with
+# Back (= Cancel, nothing changes). MIUI raises "Use USB for" every time a
+# phone's USB link connects - plugging the phone box in, and every adb
+# reconnect. Measured on a Redmi 9 (MIUI 12): it holds input focus, so each
+# dump read Settings instead of Facebook ("got the system window"), the post
+# verified as unreadable, and the run only escaped after its wander check fired.
+_DISMISSABLE_POPUPS = ("Settings$UsbDetailsActivity",)
+
+
+def dismiss_system_popup(serial):
+    """Close a known system pop-up holding focus over Facebook Lite.
+
+    Only the exact windows named in _DISMISSABLE_POPUPS are touched - never a
+    USB-debugging prompt, a permission dialog or anything else. True when one
+    was closed.
+    """
+    try:
+        _, out, _ = run(["shell", "dumpsys", "window"], serial=serial)
+    except Exception:
+        return False
+    for line in out.splitlines():
+        if "mCurrentFocus" not in line:
+            continue
+        if any(name in line for name in _DISMISSABLE_POPUPS):
+            run(["shell", "input", "keyevent", "KEYCODE_BACK"], serial=serial)
+            print(f"    [{serial}] closed the phone's 'Use USB for' pop-up")
+            dbg(serial, "popup-closed", line.strip()[:120])
+            time.sleep(0.6)
+            return True
     return False
 
 def post_ready(d):
@@ -5063,26 +5846,111 @@ def has_comment_composer(d):
     return False
 
 
-def on_post_view(d, timeout=0.0):
+def _fb_comment_box(d):
+    """Bounds of Facebook Lite's comment box wherever it sits, or None.
+
+    Across ~2,000 real dumps from the fleet the ONLY editable field Facebook
+    Lite ever showed was its comment box (a MultiAutoCompleteTextView: "Write a
+    comment…", "Sumulat ng comment...", "Comment as <name>" or a draft), so an
+    editable Facebook Lite field means a comment box is open. Fields of other
+    apps (launcher search, Google) are ignored.
+    """
+    root = hierarchy_root(d)
+    if root is None:
+        return None
+    best = None
+    for node in root.iter("node"):
+        attrs = node.attrib
+        cls = attrs.get("class", "")
+        if not ("EditText" in cls or "AutoCompleteTextView" in cls
+                or attrs.get("editable") == "true"):
+            continue
+        package = attrs.get("package")
+        if package and package != FB_PACKAGE:
+            continue
+        bounds = parse_bounds(attrs.get("bounds"))
+        if bounds and (best is None or bounds[1] > best[1]):
+            best = bounds
+    return best
+
+
+def _one_screen_read(d):
+    """A frozen Snapshot of a live phone's screen, or `d` itself.
+
+    Anything already frozen, or that is not a phone at all, is used as it is;
+    so is a live phone whose dump comes back empty (each detector then tries
+    for itself, exactly as before).
+    """
+    if (getattr(d, "_frozen", False) or not hasattr(d, "dump_hierarchy")
+            or not hasattr(d, "window_size")):
+        return d
+    try:
+        snap = Snapshot(d)
+    except Exception:
+        return d
+    return snap if snap else d
+
+
+def _reel_sheet_open(d):
+    """This thread's reel/video has its comment sheet open on screen.
+
+    With the keyboard up the sheet's box rides up to mid-screen (y=950 of 1612
+    measured) and the sheet covers the rail, so neither has_comment_composer()
+    (bottom fifth only) nor the rail check can see it - and a comment that had
+    just posted there was verified as "left the post". Search boxes sit in the
+    top of the screen and are excluded.
+    """
+    if not _is_reel_context():
+        return False
+    try:
+        box = _fb_comment_box(d)
+        if box is None:
+            return False
+        _, height = safe_window_size(d)
+        return center(box)[1] > int(height * 0.30)
+    except Exception:
+        return False
+
+
+def on_post_view(d, timeout=0.0, feed_grace=None):
     """True only when a single post (or reel) is on screen — never the feed.
 
     Waits up to `timeout` seconds for the view to settle. Returns False the
     moment Abort is pressed.
+
+    `feed_grace`: give up early once the NEWS FEED has stayed on screen this
+    many seconds. A deep link can flash the feed before it pushes the post, so
+    a moment of feed is not proof - but a feed that stays put is, and waiting
+    out a long `timeout` there only delays trying the next opener. That is what
+    lets the post-open check be patient with a SLOW post without being slow on
+    a link that landed on the feed.
     """
     deadline = time.time() + max(0.0, timeout)
+    feed_since = None
     while True:
         if stop_requested():
             return False
+        # One read of the screen for every detector below. Each used to pull
+        # its own ~140 ms dump from the phone - four or five per check - and
+        # they could disagree, having looked at different moments.
+        view = _one_screen_read(d)
         try:
-            text = visible_text(d).lower()
+            text = visible_text(view).lower()
         except Exception:
             text = ""
         # Feed veto first: if the home/feed status composer is on screen we are
         # NOT on the post, so never let a marker (or the reel check) say we are.
         on_feed = any(f in text for f in FEED_MARKERS)
+        if on_feed and feed_grace is not None:
+            now = time.time()
+            feed_since = now if feed_since is None else feed_since
+            if now - feed_since >= feed_grace:
+                return False
+        elif not on_feed:
+            feed_since = None
         if not on_feed:
             try:
-                if find_reel_like_point(d) is not None:
+                if find_reel_like_point(view) is not None:
                     return True      # the reel player is a single-item surface
             except Exception:
                 pass
@@ -5090,7 +5958,9 @@ def on_post_view(d, timeout=0.0):
                 return True
             # Text-free fallback: FB Lite usually exposes NO caption or marker
             # words, so the composer's shape is the only proof left.
-            if has_comment_composer(d):
+            if has_comment_composer(view):
+                return True
+            if _reel_sheet_open(view):
                 return True
         if time.time() >= deadline:
             return False
@@ -5098,7 +5968,9 @@ def on_post_view(d, timeout=0.0):
             return False
 
 _url_resolve_cache = {}
+_url_resolve_failed_at = {}
 _url_resolve_lock = threading.Lock()
+SHARE_RETRY_AFTER = 300.0
 _FB_CONTENT_ID = r"(?:\d+|pfbid[0-9A-Za-z]+)"
 _SHARE_TOKEN_RE = re.compile(r"^/share/(?:[a-z]/)?[^/?#]+/?$", re.I)
 
@@ -5205,10 +6077,59 @@ def _fb_native_web_url(url):
                 return base + "story.php?story_fbid=" + token + "&id=" + owner
         return base + "permalink/" + token
     return ""
+
+
+# What a link shows on the phone - and so where its comment box is:
+#   reel  - Facebook Lite's reel player. Comment is the SECOND button of the
+#           rail down the right edge (Like, Comment, Share, More) and opens a
+#           sheet with the box at the bottom. 6,593 comments in the fleet's own
+#           logs were posted that way.
+#   video - the same reel player. Facebook serves every video as a reel on a
+#           phone: measured 2026-11-18, /watch/?v=X, /<page>/videos/X and a
+#           1920x1080 /share/v/ link all answer an Android browser with
+#           https://www.facebook.com/reel/X as their canonical page, and the
+#           fleet's screenshots show landscape videos in the reel player too.
+#   post, photo, story - a single post; the box sits at its bottom.
+# /share/r|v|p/<token> carry their kind in the path even before (or without)
+# resolution, and fb.watch / fb.gg are video hosts.
+_SHARE_KINDS = {"r": "reel", "v": "video", "p": "post"}
+_target_kind_cache = {}
+
+
+def _target_kind(url):
+    """'reel', 'video', 'post', 'photo', 'story' or None (unknown)."""
+    key = str(url or "")
+    if key in _target_kind_cache:
+        return _target_kind_cache[key]
+    kind = None
+    reference = _fb_target_reference(key)
+    if reference:
+        kind = reference[0]
+    else:
+        clean = normalize_url(key)
+        if clean:
+            parts = urllib.parse.urlsplit(clean)
+            host = (parts.hostname or "").lower()
+            match = re.fullmatch(r"/share/([a-z])/[^/]+", parts.path, re.I)
+            if host in ("fb.watch", "fb.gg"):
+                kind = "video"
+            elif match:
+                kind = _SHARE_KINDS.get(match.group(1).lower())
+    if len(_target_kind_cache) > 512:
+        _target_kind_cache.clear()
+    _target_kind_cache[key] = kind
+    return kind
+
+
+def _shows_in_reel_player(url):
+    """True when Facebook Lite opens this link in its reel player."""
+    return _target_kind(url) in ("reel", "video")
 # Facebook Lite's own user agent shape. A desktop UA is answered with HTTP 400
 # on /share/ links, and facebookexternalhit returns the /videos/<slug>/<id>
-# permalink instead of the /reel/<id> form the reel player actually wants.
+# permalink instead of the /reel/<id> form the reel player actually wants -
+# which is why it is only the fallback (the ID is the same either way).
 _SHARE_UA = "Mozilla/5.0 (Linux; Android 10)"
+_CRAWLER_UA = "facebookexternalhit/1.1"
 # The canonical link lives in <head>; everything after it is app payload.
 _SHARE_HTML_LIMIT = 300000
 _CANONICAL_HREF_RE = re.compile(
@@ -5310,18 +6231,32 @@ def _canonicalize_fb_url(url):
         return url
     with _url_resolve_lock:
         if url in _url_resolve_cache:
-            return _url_resolve_cache[url]
+            # A failure is only remembered briefly: it used to stick for the
+            # life of the app, so one network blip at Start sent the raw share
+            # link - which Facebook Lite often opens on the feed - to every
+            # phone in every later run until the app was restarted.
+            failed_at = _url_resolve_failed_at.get(url)
+            if failed_at is None or time.monotonic() - failed_at < SHARE_RETRY_AFTER:
+                return _url_resolve_cache[url]
     resolved = url
     last_failure = "Facebook exposed no usable single-content permalink."
     # A share token carries its answer in the body, so HEAD can never resolve
     # one - skip straight to GET and save the wasted round trip.
-    methods = ("GET",) if is_share else ("HEAD", "GET")
-    for method in methods:
+    attempts = ([("GET", _SHARE_UA)] if is_share
+                else [("HEAD", _SHARE_UA), ("GET", _SHARE_UA)])
+    # A second opinion when the phone-browser answer names no post (a login or
+    # consent page, a rate limit, a network blip): Facebook's own link-preview
+    # crawler. Measured 2026-11-18, it is REDIRECTED straight to the content -
+    # /share/v/<t> -> /<page>/videos/<id>/?rdid=.., /share/r/<t> -> /reel/<id>
+    # - so even an unreadable page body still resolves. A video ID is also its
+    # reel ID, and _fb_uri_variants() adds the reel openers for it.
+    attempts.append(("GET", _CRAWLER_UA))
+    for method, agent in attempts:
         body = ""
         try:
             req = urllib.request.Request(
                 url, method=method,
-                headers={"User-Agent": _SHARE_UA,
+                headers={"User-Agent": agent,
                          "Accept-Language": "en-US,en;q=0.9"})
             with NOPROXY.open(req, timeout=10) as resp:
                 final = resp.geturl() or ""
@@ -5341,6 +6276,10 @@ def _canonicalize_fb_url(url):
             break
     with _url_resolve_lock:
         _url_resolve_cache[url] = resolved
+        if resolved == url:
+            _url_resolve_failed_at[url] = time.monotonic()
+        else:
+            _url_resolve_failed_at.pop(url, None)
     if resolved != url:
         print(f"  [link] resolved share/redirect -> {resolved[:80]}")
     else:
@@ -5386,6 +6325,13 @@ def _fb_uri_variants(https_url):
             # alias; the same globally unique video ID also has a watch URL.
             # Keep the exact input first and verify every alternate on-device.
             if kind == "video":
+                if token.isdigit():
+                    # A video's ID is its reel ID, and /reel/<id> is the page
+                    # Facebook itself names for any video on a phone (measured
+                    # 2026-11-18) - the reel player, whose comment button the
+                    # run knows how to find.
+                    variants.append("https://www.facebook.com/reel/" + token)
+                    variants.append(f"fb://reel/{token}")
                 variants.append("https://www.facebook.com/watch?v=" + token)
             elif kind == "photo":
                 variants.append("https://www.facebook.com/photo.php?fbid=" + token)
@@ -5421,27 +6367,194 @@ FB_LINK_ALIASES = (
 )
 
 
+_SHELL_SAFE_ARG = re.compile(r"[A-Za-z0-9_@%+=:,./-]+")
+
+
+def _device_shell_quote(value):
+    """Quote one argument for the phone's own shell.
+
+    `adb shell a b c` joins its arguments with spaces and hands that line to the
+    phone's /system/bin/sh WITHOUT escaping anything (adb does this on purpose,
+    "just like ssh"). A link such as
+
+        https://www.facebook.com/permalink.php?story_fbid=1&id=2
+
+    was therefore cut at the `&`: the phone ran `am start ... story_fbid=1` in
+    the background and then tried to run `id=2 -f 0x14000000` as a command
+    ("-f: not found"). Every https opener for permalink.php, story.php and
+    photo?fbid=..&set=.. links failed that way, before Facebook Lite ever saw
+    the whole link. Single quotes keep the link one argument.
+    """
+    text = str(value)
+    if _SHELL_SAFE_ARG.fullmatch(text):
+        return text
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
 def _post_view_attempts(uri):
+    data = _device_shell_quote(uri)
     is_fb_scheme = uri.startswith(("fb://", "facebook://"))
     if is_fb_scheme:
         return [
             ["shell", "am", "start", "-a", "android.intent.action.VIEW",
-             "-d", uri, "-p", FB_PACKAGE, "-f", "0x14000000"],
-            ["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", uri],
+             "-d", data, "-p", FB_PACKAGE, "-f", "0x14000000"],
+            ["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", data],
         ]
     attempts = [
         ["shell", "am", "start", "-n", f"{FB_PACKAGE}/{alias}",
-         "-a", "android.intent.action.VIEW", "-d", uri, "-f", "0x14000000"]
+         "-a", "android.intent.action.VIEW", "-d", data, "-f", "0x14000000"]
         for alias in FB_LINK_ALIASES
     ]
-    attempts.append(
-        ["shell", "am", "start", "-n", FB_ACTIVITY,
-         "-a", "android.intent.action.VIEW", "-d", uri, "-f", "0x14000000"])
+    # Package-scoped VIEW before MainActivity: MainActivity is measured to
+    # ignore the link and open the news feed, and open_post() only judges the
+    # FIRST opener that starts without an error, so with MainActivity ahead of
+    # it this one could never run when a build lacks both aliases. With the
+    # aliases present (the normal case) neither of these is ever reached.
     attempts.append(
         ["shell", "am", "start", "--activity-single-top",
          "-a", "android.intent.action.VIEW",
-         "-d", uri, "-p", FB_PACKAGE, "-f", "0x14000000"])
+         "-d", data, "-p", FB_PACKAGE, "-f", "0x14000000"])
+    attempts.append(
+        ["shell", "am", "start", "-n", FB_ACTIVITY,
+         "-a", "android.intent.action.VIEW", "-d", data, "-f", "0x14000000"])
     return attempts
+
+# How long one opener may take to show the post once Facebook is up. Facebook
+# Lite draws its screens from the server, so on a slow or congested connection
+# a cold start can need well over 6 s; the old 6 s check force-stopped the app
+# just before the post arrived and started it again - over and over, which is
+# what "it can't open Facebook Lite" looks like on the phone. A link that lands
+# on the news feed still fails fast: the feed only gets OPEN_FEED_GRACE.
+OPEN_VERIFY_SECONDS = 15.0
+OPEN_FEED_GRACE = 4.0
+WARM_SETTLE = 1.5
+
+# ── Phone connectivity ─────────────────────────────────────────────────────
+# Android's status bar names a connection without internet in the icon's
+# description; the fleet's own dumps show "Wifi signal full.,No internet".
+_NO_INTERNET_RE = re.compile(
+    r'content-desc="[^"]*\b(?:no internet|walang internet)\b', re.I)
+PHONE_OFFLINE_WAIT = 120.0
+GNIREHTET_PACKAGE = "com.genymobile.gnirehtet"
+GNIREHTET_SOCKET = "localabstract:gnirehtet"
+# Set by the GUI: a callable that is True while this app's USB internet is
+# sharing the PC's connection. Its tunnels live inside the ADB server and its
+# VPNs belong to it, so nothing here restarts that server or stops those VPNs
+# while it runs.
+USB_INTERNET_ACTIVE = None
+
+
+def usb_internet_active():
+    hook = USB_INTERNET_ACTIVE
+    if not hook:
+        return False
+    try:
+        return bool(hook())
+    except Exception:
+        return False
+
+
+def phone_reports_no_internet(d):
+    """True when the phone's own status bar says its connection has no internet."""
+    try:
+        xml = d.dump_hierarchy()
+    except Exception:
+        return False
+    return bool(xml) and bool(_NO_INTERNET_RE.search(xml))
+
+
+def wait_for_phone_internet(serial, d, max_wait=None):
+    """Hold off while the phone says it has no internet, instead of reopening.
+
+    Every reopen force-stops Facebook Lite, and a phone without internet cannot
+    load any post, so retrying only burns the link's attempts (and then the
+    account's) while saying nothing useful. Returns True when the phone is
+    online - or its status bar cannot be read - and False when it stayed
+    offline for `max_wait` seconds or Abort was pressed.
+    """
+    if not phone_reports_no_internet(d):
+        return True
+    limit = PHONE_OFFLINE_WAIT if max_wait is None else float(max_wait)
+    report_error("PHONE_NO_INTERNET", serial, severity="warning",
+                 detail=f"Waiting up to {int(limit)}s for the connection to return.")
+    deadline = time.monotonic() + limit
+    while time.monotonic() < deadline:
+        if not abort_sleep(5.0):
+            return False
+        if not phone_reports_no_internet(d):
+            print(f"    [{serial}] the phone's internet is back.")
+            return True
+    return False
+
+
+def _usb_tunnel_target(serial):
+    """The PC end of this phone's Gnirehtet tunnel ("tcp:PORT"), or None."""
+    rc, out, _ = run(["reverse", "--list"], serial=serial, timeout=10)
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        parts = line.split()
+        if GNIREHTET_SOCKET in parts:
+            index = parts.index(GNIREHTET_SOCKET)
+            return parts[index + 1] if index + 1 < len(parts) else "unknown"
+    return None
+
+
+def _local_port_answers(port):
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=0.5):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def stop_stale_usb_vpn(serial):
+    """Turn off a USB-internet VPN that no live relay is serving.
+
+    Gnirehtet's VPN sends ALL of the phone's traffic down the USB tunnel. When
+    the relay behind it is gone - FBVenom crashed or was killed, the PC slept,
+    or the ADB server restarted and took the tunnel with it - the phone keeps
+    the VPN up with nothing on the other end: Wi-Fi still looks connected but
+    Facebook Lite cannot load anything, so every post "fails to open".
+
+    Left alone: this app's own running USB internet (it manages its VPNs), and
+    any tunnel whose PC port still answers (a live relay, maybe another tool).
+    Returns True when a stale VPN was stopped.
+    """
+    if usb_internet_active():
+        return False
+    rc, out, _ = run(["shell", "dumpsys", "activity", "services", GNIREHTET_PACKAGE],
+                     serial=serial, timeout=15)
+    if rc != 0 or not re.search(r"ServiceRecord\{[^\n]*com\.genymobile\.gnirehtet/", out):
+        return False
+    target = _usb_tunnel_target(serial)
+    if target is not None:
+        match = re.fullmatch(r"tcp:(\d{1,5})", target)
+        if not match or _local_port_answers(match.group(1)):
+            return False
+    run(["shell", "am", "start", "-a", "com.genymobile.gnirehtet.STOP",
+         "-n", f"{GNIREHTET_PACKAGE}/.GnirehtetActivity"], serial=serial)
+    if target is not None:
+        run(["reverse", "--remove", GNIREHTET_SOCKET], serial=serial)
+    report_error("USB_VPN_STALE_STOPPED", serial, severity="warning",
+                 detail=("Its USB tunnel pointed at " + target + ", where nothing answers."
+                         if target else "It had no USB tunnel at all."))
+    return True
+
+
+_open_failure_dumps = set()
+_open_failure_lock = threading.Lock()
+
+
+def _save_open_failure(serial, d, url):
+    """Save the screen once per phone and link when a post will not open."""
+    key = (str(serial), str(url))
+    with _open_failure_lock:
+        if key in _open_failure_dumps:
+            return None
+        _open_failure_dumps.add(key)
+    return dump_debug(serial, d, "target_not_verified")
+
 
 def open_post(serial, url, allow_warm=True, verify=None):
     # Never (re)launch Facebook once Abort has been pressed.
@@ -5484,6 +6597,11 @@ def open_post(serial, url, allow_warm=True, verify=None):
                                   ("error", "exception", "unable to resolve", "not found")):
                     failures.append(f"intent rc={rc}: {low[:240]}")
                     continue
+                # The previous screen stays up for a moment after a warm intent
+                # (~0.5 s measured on a TECNO KM4) and can pass the check as if
+                # it were the new post. Let the new screen replace it first.
+                if not abort_sleep(WARM_SETTLE):
+                    return False
                 if _reached():
                     print(f"  [{serial}] post opened warm ({uri[:60]})")
                     return True
@@ -5538,6 +6656,19 @@ def open_target_post(serial, d, url, attempts=3):
         if stop_requested():
             return False
         warm = (i == 0)
+        if warm and _shows_in_reel_player(url):
+            # A reel or video opened warm while a post or reel is on screen is
+            # unprovable. Measured on a TECNO KM4 (Facebook Lite 538): a warm
+            # intent for reel B while reel A was open was "delivered to the
+            # running instance"; A stayed on screen for ~0.5 s and verified as
+            # the target, then B played with its rail hidden for 14+ s, so the
+            # run reopened anyway. A cold start opened it in 4.6-6 s. Post links
+            # keep the quick warm open (open_post waits WARM_SETTLE first).
+            try:
+                if on_post_view(d):
+                    warm = False
+            except Exception:
+                pass
         try:
             # Verify each opener variant really reaches the post, so links whose
             # only opener is a raw https (pfbid, share) don't settle on the feed.
@@ -5545,7 +6676,9 @@ def open_target_post(serial, d, url, attempts=3):
             # would force-stop a post that actually opened and loop forever.
             opened = open_post(
                 serial, url, allow_warm=warm,
-                verify=lambda: on_post_view(d, timeout=6.0) or dump_is_blind(d))
+                verify=lambda: (on_post_view(d, timeout=OPEN_VERIFY_SECONDS,
+                                             feed_grace=OPEN_FEED_GRACE)
+                                or dump_is_blind(d)))
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             opened = False
@@ -5569,6 +6702,22 @@ def open_target_post(serial, d, url, attempts=3):
                 return True
         if stop_requested():
             return False
+        # No post can load without internet, and every reopen force-stops
+        # Facebook Lite again. Fix the one cause we can fix (a USB-internet VPN
+        # with no relay behind it), then wait for the phone's connection.
+        try:
+            if stop_stale_usb_vpn(serial) and not abort_sleep(3.0):
+                return False
+        except Exception:
+            pass
+        if not wait_for_phone_internet(serial, d):
+            if stop_requested():
+                return False
+            report_error("TARGET_NOT_VERIFIED", serial, url=url,
+                         detail=f"The phone had no internet for {int(PHONE_OFFLINE_WAIT)}s, "
+                                f"so the post could not load. {last_error}".strip())
+            _save_open_failure(serial, d, url)
+            return False
         print(f"  [{serial}] not on the target post - cold reopening "
               f"({i + 1}/{attempts})")
         run(["shell", "am", "force-stop", FB_PACKAGE], serial=serial)
@@ -5576,6 +6725,7 @@ def open_target_post(serial, d, url, attempts=3):
             return False
     report_error("TARGET_NOT_VERIFIED", serial, url=url,
                  detail=f"Target verification failed after {attempts} attempts. {last_error}")
+    _save_open_failure(serial, d, url)
     return False
 
 def chooser_present(serial, d):
@@ -5674,6 +6824,10 @@ class Snapshot:
         self.serial = getattr(dev, "serial", None)
         self._xml = safe_dump(dev)
         self._size = safe_window_size(dev)
+        # Learn the live phone's density now (once per phone, cached by
+        # serial), so the detectors reading this frozen copy size their
+        # limits for the real screen instead of guessing from its width.
+        px_per_dp(dev)
 
     def dump_hierarchy(self, *a, **k):
         return self._xml
@@ -5745,6 +6899,7 @@ def _wait_for_reaction_tray(d, timeout=5.0):
                 return True
         root = hierarchy_root(d)
         if root is not None:
+            px = _scaler(d)
             imgs = []
             for node in root.iter("node"):
                 if node.attrib.get("class") != "android.widget.ImageView":
@@ -5755,7 +6910,7 @@ def _wait_for_reaction_tray(d, timeout=5.0):
                     if len(parts) != 4: continue
                     x1, y1, x2, y2 = map(int, parts)
                     w, h = x2 - x1, y2 - y1
-                    if 85 <= w <= 130 and 85 <= h <= 130:
+                    if px(85) <= w <= px(130) and px(85) <= h <= px(130):
                         imgs.append(((x1 + x2) // 2, (y1 + y2) // 2))
                 except Exception:
                     pass
@@ -5783,16 +6938,17 @@ def find_action_row_like_point(d):
                         print(f"    [react] found Like by label at ({cx},{cy})")
                         return cx, cy
 
+    px = _scaler(d)
     rows = {}
     for b in clickable_bounds(d):
         x1, y1, x2, y2 = b
         w = x2 - x1
         h = y2 - y1
-        if h < 35 or h > 160 or y1 < int(height * 0.20):
+        if h < px(35) or h > px(160) or y1 < int(height * 0.20):
             continue
         if w < int(width * 0.10) or w > int(width * 0.50):
             continue
-        key = (y1 // 10, y2 // 10)
+        key = (y1 // px(10), y2 // px(10))
         rows.setdefault(key, []).append(b)
 
     for _, row in sorted(rows.items(), key=lambda kv: min(b[1] for b in kv[1])):
@@ -5802,7 +6958,7 @@ def find_action_row_like_point(d):
         left  = row[0]
         right = row[-1]
         covers_width = left[0] <= int(width * 0.15) and right[2] >= int(width * 0.85)
-        same_band = (max(b[1] for b in row) - min(b[1] for b in row)) <= 30
+        same_band = (max(b[1] for b in row) - min(b[1] for b in row)) <= px(30)
         if same_band and covers_width:
             left_w = left[2] - left[0]
             if left_w > int(width * 0.45):
@@ -5817,7 +6973,7 @@ def find_action_row_like_point(d):
     for b in clickable_bounds(d):
         x1, y1, x2, y2 = b
         w, h = x2 - x1, y2 - y1
-        if h < 35 or h > 160:
+        if h < px(35) or h > px(160):
             continue
         if w < int(width * 0.08) or w > int(width * 0.55):
             continue
@@ -5826,7 +6982,7 @@ def find_action_row_like_point(d):
         candidates.append(b)
     groups = {}
     for b in candidates:
-        groups.setdefault((b[1] + b[3]) // 2 // 50, []).append(b)
+        groups.setdefault((b[1] + b[3]) // 2 // px(50), []).append(b)
     for _, group in sorted(groups.items(), key=lambda kv: min(b[1] for b in kv[1])):
         if len(group) < 2:
             continue
@@ -5851,6 +7007,7 @@ def find_reaction_tray_points(d, like_point=None):
 
     root = hierarchy_root(d)
     if root is not None:
+        px = _scaler(d)
         icons = []
         for node in root.iter("node"):
             if node.attrib.get("class") != "android.widget.ImageView":
@@ -5859,14 +7016,14 @@ def find_reaction_tray_points(d, like_point=None):
             if not b:
                 continue
             bw, bh = b[2]-b[0], b[3]-b[1]
-            if 85 <= bw <= 130 and 85 <= bh <= 130:
+            if px(85) <= bw <= px(130) and px(85) <= bh <= px(130):
                 cx, cy = center(b)
-                if like_point is None or cy < like_point[1] + 10:
+                if like_point is None or cy < like_point[1] + px(10):
                     icons.append((cx, cy))
         if icons:
             bands = {}
             for cx, cy in icons:
-                bands.setdefault(round(cy / 35), []).append((cx, cy))
+                bands.setdefault(round(cy / px(35)), []).append((cx, cy))
             rows = [sorted(v) for v in bands.values() if len(v) >= 3]
             rows.sort(key=lambda r: r[0][1])
             if len(rows) >= 2 and len(rows[0]) == 3 and len(rows[1]) == 4:
@@ -6030,6 +7187,9 @@ def _rail_is_uniform(stack, width_tol=0.30, gap_tol=0.12):
 
 def _reel_action_stack(d):
     width, height = safe_window_size(d)
+    # Sizes measured on the 720-px fleet (rail buttons ~108x128 there); px()
+    # carries them to this screen - 148x176 on a 1080-px, density-440 phone.
+    px = _scaler(d)
     col = []
     for b in clickable_bounds(d):
         x1, y1, x2, y2 = b
@@ -6038,7 +7198,7 @@ def _reel_action_stack(d):
         cx = (x1 + x2) // 2
         if cx < int(width * 0.82):
             continue
-        if w < 35 or w > 140 or h < 40 or h > 175:
+        if w < px(35) or w > px(140) or h < px(40) or h > px(175):
             continue
         if y1 < int(height * 0.42):
             continue
@@ -6048,11 +7208,11 @@ def _reel_action_stack(d):
     col.sort(key=lambda b: b[1])
     stack = [col[0]]
     for b in col[1:]:
-        if b[1] - stack[-1][1] >= 60:
+        if b[1] - stack[-1][1] >= px(60):
             stack.append(b)
     if len(stack) < 3:
         return None
-    if stack[-1][1] - stack[0][1] < 120:
+    if stack[-1][1] - stack[0][1] < px(120):
         return None
     if center(stack[0])[1] > int(height * 0.88):
         return None
@@ -6074,6 +7234,19 @@ def _reel_action_stack(d):
     # are evenly spaced.
     if not _rail_is_uniform(stack):
         return None
+    # A reel's comment SHEET lists every comment with a small Like button down
+    # the right side, and four one-line comments space those as evenly as the
+    # rail. Measured on 6 real sheets: those buttons end at x=702-704 with the
+    # comment box open, while the real rail runs to the screen edge (x=720 on
+    # all 64 real reel-player screens, which never show a comment box). Without
+    # this, a sheet passed as the reel player and "Like" or "Comment" landed on
+    # somebody's comment. A sheet whose comments are switched off has no box,
+    # but it also hides the player's progress bar (a SeekBar on 47 of the 64
+    # real player screens; every one of the 64 reaches the edge anyway).
+    if any(b[2] < width - px(8) for b in stack):
+        if (_fb_comment_box(d) is not None
+                or "android.widget.SeekBar" not in (safe_dump(d) or "")):
+            return None
     if _has_post_action_row(d) and not _is_reel_context():
         return None
     return [center(b) for b in stack]
@@ -6097,6 +7270,7 @@ def find_reel_tray_points(d):
     post.
     """
     width, height = safe_window_size(d)
+    px = _scaler(d)
     floor = int(height * 0.30)
     rows = {}
     for b in clickable_bounds(d):
@@ -6107,9 +7281,9 @@ def find_reel_tray_points(d):
             continue
         if w < int(width * 0.08) or w > int(width * 0.20):
             continue
-        if h < 55 or h > 145:
+        if h < px(55) or h > px(145):
             continue
-        rows.setdefault(y1 // 14, []).append(b)
+        rows.setdefault(y1 // px(14), []).append(b)
     for _, row in sorted(rows.items()):
         row = sorted(row, key=lambda b: b[0])
         if len(row) >= 7:
@@ -6119,8 +7293,16 @@ def find_reel_tray_points(d):
     return None
 
 def _is_reel_context():
-    u = (current_post_url() or "")
-    return bool(re.search(r"/share/r/|/reel[s]?/|/reel\b", u, re.I))
+    """True when this thread's link opens in the reel player.
+
+    Reels AND videos: Facebook Lite plays every video there (see
+    _target_kind). Only /reel/ and /share/r/ used to count, so a /share/v/,
+    fb.watch, /watch?v= or /<page>/videos/ link that opened in the reel player
+    was judged "not the target post" - the reel's author row looks like a
+    post's action row - and never got its comment (19 real fleet screens show
+    exactly that refusal on an open reel).
+    """
+    return _shows_in_reel_player(current_post_url() or "")
 
 def _wait_reel_like(d, timeout=6.0):
     pt = find_reel_like_point(d)
@@ -6132,7 +7314,12 @@ def _wait_reel_like(d, timeout=6.0):
     while time.time() < deadline:
         if not revealed:
             try:
-                d.click(int(w * 0.5), int(h * 0.5))
+                if _fb_comment_box(d) is not None:
+                    # A comment sheet covers the rail. Tapping the middle would
+                    # land on someone's comment; Back closes the sheet instead.
+                    d.press("back")
+                else:
+                    d.click(int(w * 0.5), int(h * 0.5))
             except Exception:
                 pass
             revealed = True
@@ -6157,15 +7344,16 @@ def _find_post_like(d):
     anchoring the row to the left edge is what separates them.
     """
     width, height = safe_window_size(d)
+    px = _scaler(d)
     rows = {}
     for b in clickable_bounds(d):
         x1, y1, x2, y2 = b
         bw, bh = x2 - x1, y2 - y1
-        if bh < 40 or bh > 140:
+        if bh < px(40) or bh > px(140):
             continue
         if bw < int(width * 0.12) or bw > int(width * 0.42):
             continue
-        rows.setdefault(round((y1 + y2) / 2 / 26), []).append(b)
+        rows.setdefault(round((y1 + y2) / 2 / px(26)), []).append(b)
     for _, row in sorted(rows.items()):
         row = sorted(row, key=lambda b: b[0])
         if len(row) < 3:
@@ -6464,24 +7652,25 @@ def is_suspended(d):
 
 def is_suspended_layout(d):
     width, height = safe_window_size(d)
+    px = _scaler(d)
     items = clickable_items(d)
     if not (3 <= len(items) <= 6):
         return False
     points = [(b, center(b)) for b, _ in items]
     has_top_right = any(
         x > int(width * 0.85) and int(height * 0.04) <= y <= int(height * 0.12)
-        and 40 <= b[2]-b[0] <= 90 and 40 <= b[3]-b[1] <= 90
+        and px(40) <= b[2]-b[0] <= px(90) and px(40) <= b[3]-b[1] <= px(90)
         for b, (x, y) in points)
     has_profile = any(
         int(width*0.40) <= x <= int(width*0.60) and
         int(height*0.10) <= y <= int(height*0.22) and
-        70 <= b[2]-b[0] <= 130 and 70 <= b[3]-b[1] <= 130
+        px(70) <= b[2]-b[0] <= px(130) and px(70) <= b[3]-b[1] <= px(130)
         for b, (x, y) in points)
     has_appeal_button = any(
         int(width*0.03) <= b[0] <= int(width*0.08) and
         b[2] >= int(width*0.92) and
         int(height*0.35) <= y <= int(height*0.48) and
-        45 <= b[3]-b[1] <= 90
+        px(45) <= b[3]-b[1] <= px(90)
         for b, (x, y) in points)
     return has_top_right and has_profile and has_appeal_button
 
@@ -6590,13 +7779,14 @@ def open_fb_home(serial, d, force=True):
 
 def find_gear_icon(d):
     width, height = safe_window_size(d)
+    px = _scaler(d)
     candidates = []
     for b, attrs in clickable_items(d):
         cx, cy = center(b)
         if cy > int(height * 0.12) or cx < int(width * 0.80):
             continue
         w, h = b[2]-b[0], b[3]-b[1]
-        if 40 <= w <= 100 and 40 <= h <= 100:
+        if px(40) <= w <= px(100) and px(40) <= h <= px(100):
             candidates.append((cx, b))
     if not candidates:
         return None
@@ -6631,13 +7821,14 @@ def find_logout_row(d):
         if "log out" in low or "logout" in low:
             return center(b)
     width, height = safe_window_size(d)
+    px = _scaler(d)
     sheet_rows = []
     for b, _ in clickable_items(d):
         w  = b[2]-b[0]
         h  = b[3]-b[1]
         cx, cy = center(b)
         if (b[0] <= int(width*0.08) and b[2] >= int(width*0.90) and
-                cy > int(height*0.70) and w > int(width*0.75) and h >= 50):
+                cy > int(height*0.70) and w > int(width*0.75) and h >= px(50)):
             sheet_rows.append((cy, b))
     if len(sheet_rows) >= 2:
         return center(sorted(sheet_rows)[-1][1])
@@ -6654,6 +7845,7 @@ def confirm_logout_if_needed(d):
                 time.sleep(3)
                 return True
     width, height = safe_window_size(d)
+    px = _scaler(d)
     buttons = []
     for b, _ in clickable_items(d):
         w  = b[2]-b[0]
@@ -6661,7 +7853,7 @@ def confirm_logout_if_needed(d):
         cx, cy = center(b)
         if (int(width*0.15) <= cx <= int(width*0.85) and
                 int(height*0.52) <= cy <= int(height*0.62) and
-                150 <= w <= 260 and 45 <= h <= 90):
+                px(150) <= w <= px(260) and px(45) <= h <= px(90)):
             buttons.append((cx, b))
     if len(buttons) >= 2:
         d.click(*center(sorted(buttons)[0][1]))
@@ -6690,6 +7882,7 @@ def logout_current_account(serial, d):
 
 def login_screen_account_rows(d):
     width, height = safe_window_size(d)
+    px = _scaler(d)
     rows = []
     for b, attrs in clickable_items(d):
         desc = normalize_account_name(attrs.get("content-desc") or attrs.get("text"))
@@ -6699,7 +7892,7 @@ def login_screen_account_rows(d):
         if any(skip in low for skip in ACCOUNT_SKIP_TEXT):
             continue
         w, h = b[2]-b[0], b[3]-b[1]
-        if w < int(width * 0.50) or h < 60:
+        if w < int(width * 0.50) or h < px(60):
             continue
         rows.append({"name": desc, "bounds": b, "point": center(b)})
     deduped, seen = [], set()
@@ -6739,6 +7932,7 @@ def find_switch_account_arrow(d):
             return None
     except Exception:
         pass
+    px = _scaler(d)
     arrows = []
     for b, _ in clickable_items(d):
         x1, y1, x2, y2 = b
@@ -6747,7 +7941,7 @@ def find_switch_account_arrow(d):
         cx, cy = center(b)
         if cx < int(width*0.78) or cy < int(height*0.12) or cy > int(height*0.34):
             continue
-        if 35 <= w <= 90 and 35 <= h <= 90:
+        if px(35) <= w <= px(90) and px(35) <= h <= px(90):
             arrows.append((cy, cx, b))
     if not arrows:
         return None
@@ -6834,10 +8028,11 @@ def _uniform_stack(d, min_rows=2, min_w=0.50):
     x-range, one height, and sits flush against the next.
     """
     width, height = safe_window_size(d)
+    px = _scaler(d)
     rows = []
     for b, _ in clickable_items(d):
         w, h = b[2] - b[0], b[3] - b[1]
-        if w < int(width * min_w) or h < 60 or h > 260:
+        if w < int(width * min_w) or h < px(60) or h > px(260):
             continue
         if b[1] < int(height * 0.10):
             continue
@@ -6859,7 +8054,7 @@ def _uniform_stack(d, min_rows=2, min_w=0.50):
     # to the loose group, which is what defeated this check before.
     best_run, run = [], [best[0]]
     for b in best[1:]:
-        if abs(b[1] - run[-1][3]) <= max(12, (b[3] - b[1]) // 6):
+        if abs(b[1] - run[-1][3]) <= max(px(12), (b[3] - b[1]) // 6):
             run.append(b)
         else:
             if len(run) > len(best_run):
@@ -6881,7 +8076,7 @@ def find_menu_button_geometric(d):
     # bar is also small and also touches the right edge, so a plain "rightmost
     # near the top" picks Marketplace instead of the hamburger.
     top_y = min(b[1] for b in top)
-    band = [b for b in top if b[1] - top_y <= 40]
+    band = [b for b in top if b[1] - top_y <= _scaler(d)(40)]
     right = max(band, key=lambda b: b[2])
     if right[2] < int(width * 0.80):     # must actually hug the right edge
         return None
@@ -6908,9 +8103,10 @@ def find_switch_account_card(d):
         return None
     wide.sort(key=lambda b: b[1])
     # drop nested duplicates: keep one card per y-band
+    band = _scaler(d)(40)
     picked = []
     for b in wide:
-        if picked and b[1] - picked[-1][1] < 40:
+        if picked and b[1] - picked[-1][1] < band:
             continue
         picked.append(b)
     if len(picked) < 2:
@@ -7106,6 +8302,7 @@ def account_rows(d):
     if not switcher_is_open(d):
         return []
     width, height = safe_window_size(d)
+    px = _scaler(d)
     cands = []
     for b, attrs in clickable_items(d):
         desc = normalize_account_name(attrs.get("content-desc") or attrs.get("text"))
@@ -7115,7 +8312,7 @@ def account_rows(d):
         if any(skip in low for skip in ACCOUNT_SKIP_TEXT):
             continue
         w, h = b[2] - b[0], b[3] - b[1]
-        if w < int(width * 0.50) or h < 60 or h > 220:
+        if w < int(width * 0.50) or h < px(60) or h > px(220):
             continue
         if b[1] < int(height * 0.12):        # keep out of the top app bar only
             continue
@@ -7466,12 +8663,13 @@ def find_reel_comment_point(d):
 
 def find_feed_action_row(d):
     width, height = safe_window_size(d)
+    px = _scaler(d)
     rows = {}
     for b in clickable_bounds(d):
         x1, y1, x2, y2 = b
         w = x2-x1
         h = y2-y1
-        if h < 40 or h > 140:
+        if h < px(40) or h > px(140):
             continue
         # Current Lite uses narrow Like / Comment / Share pills, often only
         # 14% of the screen wide. Match the same measured band as
@@ -7479,12 +8677,12 @@ def find_feed_action_row(d):
         # a reaction row but no discoverable Comment button.
         if w < int(width * 0.12) or w > int(width * 0.55):
             continue
-        rows.setdefault(round((y1 + y2) / 2 / 26), []).append(b)
+        rows.setdefault(round((y1 + y2) / 2 / px(26)), []).append(b)
     for _, row in sorted(rows.items()):
         row = sorted(row, key=lambda b: b[0])
         if not 2 <= len(row) <= 4:
             continue
-        same_band = max(b[1] for b in row) - min(b[1] for b in row) <= 24
+        same_band = max(b[1] for b in row) - min(b[1] for b in row) <= px(24)
         covers = row[0][0] <= int(width * 0.12) and row[-1][2] >= int(width * 0.55)
         if len(row) == 2:
             # Some group layouts have only Like and Comment when sharing is
@@ -7569,11 +8767,28 @@ def wait_for_edit_box(d, timeout=8):
         time.sleep(0.5)
     return None
 
+def _tap_for_comment_box(serial, d, point, wait=8):
+    d.click(*point)
+    time.sleep(2)
+    if chooser_present(serial, d):
+        dismiss_chooser(serial, d)
+        time.sleep(2)
+    return wait_for_edit_box(d, timeout=wait)
+
+
 def try_open_comment_from_screen(serial, d):
     edits = edit_nodes(d)
     if edits:
         edits.sort(key=lambda e: -e[0][1])
         return center(edits[0][0])
+    if _is_reel_context():
+        point = find_reel_comment_point(d)
+        if point is not None:
+            # The reel player is up, and its rail is the ONLY way into the
+            # comments: the second button (Like, Comment, Share, More). The
+            # post guesses below were written for posts, and on a reel they
+            # can take the author row for a Comment button and open a profile.
+            return _tap_for_comment_box(serial, d, point, wait=10)
     for b, attrs in clickable_items(d):
         label = (attrs.get("content-desc") or attrs.get("text") or "").lower()
         if "comment" in label or "write a" in label:
@@ -7619,6 +8834,36 @@ def find_enter_key(d):
                 pass
     return None
 
+def _reel_surface(d):
+    """The reel player, or this reel's comment sheet, is on screen."""
+    try:
+        return find_reel_like_point(d) is not None or _reel_sheet_open(d)
+    except Exception:
+        return False
+
+
+def _retry_reel_comment_box(serial, d, tries=2):
+    """The reel is up but its comment box has not appeared yet.
+
+    Never swipe here. A vertical swipe in the reel player is NEXT REEL, and
+    every reel passes as "the post", so the post-style scroll-for-the-box loop
+    used to walk away from the target and could comment on a stranger's reel.
+    A slow sheet gets time instead, then Comment is pressed again.
+    """
+    for attempt in range(tries):
+        if not abort_sleep(1.5):
+            return None
+        box = try_open_comment_from_screen(serial, d)
+        if box is not None:
+            print(f"    [comment] reel comment box opened on retry {attempt + 1}")
+            return box
+        if stop_requested():
+            return None
+    print("    [comment] the reel's comment box never opened - not scrolling away")
+    dump_debug(serial, d, "reel_comment_box_missing")
+    return None
+
+
 def open_comment_composer(serial, d, max_scrolls=10):
     # Long captions push the comment box below the fold, so keep scrolling for
     # it — but only while we are still on the target post, so a big post is
@@ -7632,6 +8877,8 @@ def open_comment_composer(serial, d, max_scrolls=10):
     for i in range(max_scrolls):
         if stop_requested():
             return None
+        if _is_reel_context() and _reel_surface(d):
+            return _retry_reel_comment_box(serial, d)
         if not on_post_view(d):
             print("    [comment] left the target post while scrolling - stopping")
             return None
@@ -7648,43 +8895,98 @@ def open_comment_composer(serial, d, max_scrolls=10):
             return box
     return None
 
-def find_send_button(d):
-    width, height = safe_window_size(d)
-    box_y = None
+# A label in the comment row that rules a control out as Send, in any Facebook
+# Lite layout or language. Anything else - an unlabelled icon, or a Send icon
+# labelled in Filipino - is judged by WHERE it sits, not by what it says.
+_NOT_SEND_WORDS = ("voice", "delete", "space", "search", "done", "next",
+                   "previous", "back", "home", "overview", "recent", "camera",
+                   "photo", "picture", "gallery", "gif", "sticker", "emoji",
+                   "avatar", "profile", "like", "react", "more", "attach",
+                   "mention", "close", "cancel", "details")
+_SEND_WORDS = ("send", "post", "submit", "publish", "ipadala", "i-post", "ipost",
+               "magpadala", "i-send")
+# What an EMPTY comment field shows. Facebook Lite's Nov-2026 layout puts the
+# account's name in it ("Comment as Jie Jie") and the Taglish UI says "Sumulat
+# ng comment..." - neither matched, so a comment that HAD posted was reported
+# as unverified and counted as a failure.
+_COMPOSER_HINTS = ("write a comment", "write a public comment", "add a comment",
+                   "magsulat ng komento", "sumulat ng komento")
+_COMPOSER_HINT_PREFIXES = ("comment as ", "write a ", "add a comment",
+                           "sumulat ng ", "magsulat ng ", "mag-comment",
+                           "mag-komento", "magkomento")
+
+
+def _composer_is_placeholder(value):
+    """True when the comment field shows its empty-state hint, in any layout."""
+    value = " ".join(str(value or "").lower().split()).rstrip(" .…")
+    return value in _COMPOSER_HINTS or value.startswith(_COMPOSER_HINT_PREFIXES)
+
+
+def _composer_bounds(d):
+    """Bounds of the comment draft: the lowest editable field on screen."""
     try:
-        edits = [(bounds, attrs) for bounds, attrs in edit_nodes(d)
+        edits = [bounds for bounds, attrs in edit_nodes(d)
                  if ("EditText" in attrs.get("class", "")
                      or "AutoCompleteTextView" in attrs.get("class", "")
                      or attrs.get("editable") == "true")]
-        if edits:
-            box_y = center(max(edits, key=lambda item: item[0][1])[0])[1]
     except Exception:
-        pass
+        return None
+    return max(edits, key=lambda bounds: bounds[1]) if edits else None
 
-    send_labels = {"send", "post", "submit", "publish", "send comment", "post comment"}
 
-    def beside_composer(bounds):
+def find_send_button(d):
+    """The comment's Send control, found beside the draft it belongs to.
+
+    Measured on the fleet's own screens (FBPoison/FBVenom debug dumps; every
+    phone is 720 px wide): once text is typed, Facebook Lite shows ONE
+    clickable icon at the right end of the comment row - 68x64 at x=626 in the
+    Nov-2026 "Comment as <name>" layout, 59x56 at x=638 in the older one - with
+    a strip of quick-emoji cells (90x112) just above the row. With the keyboard
+    down on a gesture-navigation phone, that row IS the bottom of the screen,
+    so the old "ignore the bottom 100 px" rule (meant for the Back/Home bar)
+    hid Send entirely: the comment was typed and never sent, and only phones
+    with an on-screen button bar kept commenting. The row is now anchored to
+    the draft field itself: anything level with any part of it, which also
+    covers a draft that has wrapped onto several lines.
+    """
+    width, height = safe_window_size(d)
+    composer = _composer_bounds(d)
+
+    def in_row(bounds):
         x1, y1, x2, y2 = bounds
-        cx, cy = center(bounds)
-        if x1 < 0 or x2 > width or y2 > height or y1 < int(height * 0.40):
+        if x1 < 0 or x2 > width or y2 > height:
             return False
-        if cy > height - 100:
-            return False
-        # A keyboard key under the draft is not its Send button. Prefer the
-        # same horizontal band as the actual editable composer.
-        return box_y is None or abs(cy - box_y) <= max(70, int(height * 0.035))
+        cy = (y1 + y2) // 2
+        if composer is None:
+            # Nothing to anchor to: stay clear of the system navigation bar.
+            return y1 >= int(height * 0.25) and cy <= height - _scaler(d)(100)
+        margin = max(24, int(height * 0.025))
+        return composer[1] - margin <= cy <= composer[3] + margin
+
+    def says(label, words):
+        return any(word in label for word in words)
 
     candidates = []
     for bounds, attrs in clickable_items(d):
-        if not beside_composer(bounds):
+        cls = attrs.get("class", "")
+        if "EditText" in cls or "AutoCompleteTextView" in cls or bounds == composer:
+            continue                       # the draft itself, not its button
+        if not in_row(bounds):
             continue
         x1, y1, x2, y2 = bounds
         cx, cy = center(bounds)
         label = (attrs.get("content-desc") or attrs.get("text") or "").strip().lower()
-        if label in send_labels and cx > width * 0.5:
+        if label and says(label, _NOT_SEND_WORDS):
+            continue
+        if label and says(label, _SEND_WORDS) and cx > width * 0.5:
             candidates.append((9, (cx, cy)))
-        elif (not label and box_y is not None and x1 >= int(width * 0.85)
-              and 55 <= x2 - x1 <= 90 and 55 <= y2 - y1 <= 90):
+            continue
+        w, h = x2 - x1, y2 - y1
+        # Icon-sized relative to the screen, so it holds at any density.
+        iconish = (0.06 * width <= w <= 0.16 * width
+                   and 0.06 * width <= h <= 0.16 * width
+                   and 0.6 <= w / max(h, 1) <= 1.6)
+        if composer is not None and iconish and x1 >= int(width * 0.78):
             candidates.append((1 + cx / width, (cx, cy)))
     if candidates:
         candidates.sort(key=lambda candidate: -candidate[0])
@@ -7699,81 +9001,67 @@ def find_send_button(d):
             if send_btn.exists:
                 bounds = send_btn.info["bounds"]
                 rect = (bounds["left"], bounds["top"], bounds["right"], bounds["bottom"])
-                if beside_composer(rect) and center(rect)[0] > width * 0.5:
+                if in_row(rect) and center(rect)[0] > width * 0.5:
                     return center(rect)
         except Exception:
             continue
     return None
 
 def type_text(serial, d, point, text):
+    """Put the comment into Facebook Lite's comment box - never key by key.
+
+    Measured live on a TECNO KM4 (Facebook Lite 538, the "Comment as <name>"
+    box on posts): after 2-3 injected keystrokes the box drops focus and the
+    keyboard closes. The remaining keystrokes then move focus to the header's
+    Back arrow, and a typed space PRESSES it - the draft is lost and the phone
+    lands on the news feed (or the previous reel). `adb shell input text "x y"`
+    put "tes" in the box and then went back; key events T,E,S,T put "te".
+    uiautomator2's set_text wrote the whole comment, and the Send arrow
+    appeared without a single keystroke; its input-method send_keys did too.
+    So: write the text into the field, verify it is IN the field, and send no
+    keystrokes at all - no Backspace clearing (set_text replaces the content,
+    and a Backspace with nothing focused is not harmless either), and no extra
+    space-then-delete afterwards.
+    """
     if stop_requested():
         return False
-    d.click(*point)
-    if not abort_sleep(1.2):
+    d.click(*point)                  # focus the box, as a person would
+    if not abort_sleep(1.0):
         return False
-    try:
-        # ONE adb round trip, not 43. `input keyevent` accepts a whole list of
-        # keycodes, and each separate invocation costs ~200ms on these phones,
-        # so the old 40-iteration clearing loop spent ~8s on EVERY comment -
-        # measured 8.9s to type 4 characters. Same keystrokes, same effect.
-        run(["shell", "input", "keyevent", "KEYCODE_CTRL_A", "KEYCODE_DEL",
-             "KEYCODE_MOVE_END"] + ["KEYCODE_DEL"] * 40, serial=serial)
-        abort_sleep(0.2)
-    except Exception:
-        pass
-    safe_text = (text
-                .replace("\\", "\\\\")
-                .replace("'", "\\'")
-                .replace('"', '\\"')
-                .replace("&", "\\&")
-                .replace("<", "\\<")
-                .replace(">", "\\>")
-                .replace("|", "\\|")
-                .replace(";", "\\;")
-                .replace("(", "\\(")
-                .replace(")", "\\)")
-                .replace("$", "\\$")
-                .replace("`", "\\`")
-                .replace("*", "\\*")
-                .replace("?", "\\?")
-                .replace("[", "\\[")
-                .replace("]", "\\]")
-                .replace("{", "\\{")
-                .replace("}", "\\}")
-                .replace("~", "\\~")
-                .replace(" ", "%s"))
-    typed = text.strip()[:15].lower()
+    want = " ".join(text.strip().lower().split())[:15]
 
-    def _via_adb():
-        run(["shell", "input", "text", safe_text], serial=serial)
+    def field_has_draft():
+        for _bounds, attrs in edit_nodes(d):
+            cls = attrs.get("class", "")
+            if ("EditText" in cls or "AutoCompleteTextView" in cls
+                    or attrs.get("editable") == "true"):
+                if want and want in " ".join(attrs.get("text", "").lower().split()):
+                    return True
+        return False
+
+    def _set_text():
+        box = d(className="android.widget.MultiAutoCompleteTextView")
+        if not box.exists:
+            box = d(className="android.widget.EditText")
+        box.set_text(text)
         time.sleep(0.8)
-        return typed in visible_text(d).lower()
+        return field_has_draft()
 
-    def _via_u2():
-        el = d(className="android.widget.MultiAutoCompleteTextView")
-        if not el.exists:
-            el = d(className="android.widget.EditText")
-        el.set_text(text)
+    def _input_method():
+        # uiautomator2's own input method: committed text, not key events.
+        d.send_keys(text)
         time.sleep(0.8)
-        return typed in visible_text(d).lower()
+        return field_has_draft()
 
-    # `adb shell input text` is ASCII-only: an emoji either vanishes or arrives
-    # as garbage, and when it sits past the first 15 characters the check below
-    # still passes, so the comment posts with the emoji quietly missing. Anything
-    # non-ASCII therefore goes through uiautomator2's set_text first, which
-    # takes arbitrary Unicode, and falls back to adb rather than the reverse.
-    order = ((_via_u2, _via_adb) if any(ord(c) > 127 for c in text)
-             else (_via_adb, _via_u2))
-    ok = False
-    for fn in order:
+    for fn in (_set_text, _input_method):
         try:
-            ok = fn()
+            if fn():
+                return True
         except Exception as e:
-            print(f"    [type] {fn.__name__} failed: {e}")
-            ok = False
-        if ok:
-            break
-    return ok
+            print(f"    [type] {fn.__name__} failed: {type(e).__name__}: {e}")
+        if stop_requested():
+            return False
+    return False
 
 def post_comment(serial, d, text):
     """Submit once, and count only a verified composer-clear transition.
@@ -7820,12 +9108,10 @@ def post_comment(serial, d, text):
         if typed in value:
             return "draft"
         # Android may expose the field's hint through `text` after clearing.
-        # Exact placeholder matching avoids treating arbitrary post text as
-        # an empty draft, while allowing normal English/Filipino composers.
-        placeholder = value.rstrip(" .…")
-        hints = {"write a comment", "write a public comment", "add a comment",
-                 "magsulat ng komento", "sumulat ng komento"}
-        if not value or placeholder in hints:
+        # Placeholder matching avoids treating arbitrary post text as an empty
+        # draft, while covering every composer seen on the fleet: English,
+        # Taglish ("Sumulat ng comment...") and "Comment as <account name>".
+        if not value or _composer_is_placeholder(value):
             return "empty"
         return "other"
 
@@ -7861,6 +9147,8 @@ def post_comment(serial, d, text):
                         send = point
                         break
     if send is None:
+        # Keep the screen: this failure used to leave no evidence at all.
+        dump_debug(serial, d, "comment_send_failed")
         return fail("COMMENT_SEND_FAILED", "comment-send-failed", "No usable Send or Enter control.")
     if stop_requested():
         return "stopped"
@@ -7880,6 +9168,7 @@ def post_comment(serial, d, text):
         state = composer_state()
         if state == "empty" and on_post_view(d):
             return f"commented:{text}"
+    dump_debug(serial, d, "comment_unverified")
     return fail("COMMENT_SUBMIT_UNVERIFIED", "comment-submit-unverified",
                 "The editable composer did not visibly clear on the post.")
 
@@ -8122,7 +9411,13 @@ def _process_target(serial, d, tgt, account_num, link_no, n_links,
         # straight to the offline pool.
         ctx = (comment_examples_as_context(comment_example)
                if comment_example.strip() else "")
-        text = unique_comment(comment_example, ctx=ctx)
+        # Usually composed already, while the phone was opening this post.
+        text = take_prefetched_comment(url, comment_example)
+        if stop_requested():
+            results.append("stopped")
+            return "abort"
+        if text is None:
+            text = unique_comment(comment_example, ctx=ctx)
         if not text:
             # Every wording is already under this post. Skipping is the correct
             # outcome - posting a duplicate is worse than posting nothing.
@@ -8233,35 +9528,97 @@ def make_target(url, reaction="like", comment="", do_react=True, do_comment=Fals
             "do_comment": bool(do_comment)}
 
 
-def normalize_targets_for_phones(targets):
+# Longest ENVENOM holds the phones for share-link lookups. A lookup normally
+# answers in ~1 s; one that has not by then is not worth every phone sitting
+# idle (a failing one could take 20 s: two attempts of 10 s each). Facebook
+# Lite opens a /share/ link by itself - measured on a TECNO KM4 (FB Lite 538),
+# an unresolved /share/v/ link opened and verified in 4.6 s - so the phones get
+# the cleaned share link and the lookup finishes in the background, cached for
+# the next run.
+RESOLVE_BUDGET = 4.0
+_lookup_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=8, thread_name_prefix="link-lookup")
+_lookups = {}
+_lookups_lock = threading.Lock()
+
+
+def _lookup(url):
+    """One shared background lookup per link (finished ones re-run from cache)."""
+    key = normalize_url(url) or str(url or "")
+    with _lookups_lock:
+        future = _lookups.get(key)
+        if future is None or future.done():
+            future = _lookup_pool.submit(normalize_phone_url, key)
+            _lookups[key] = future
+        return future
+
+
+def normalize_targets_for_phones(targets, budget=None):
     """Resolve every target once before any phone worker receives it.
 
-    Resolution is a network fetch per share link (~0.9s each), and it used to
-    run one link after another with the phones idle the whole time - fifteen
-    links meant ~13s of nothing happening after the button was pressed. They
-    are independent, so they run together and the wall time is one link's.
+    Resolution is a network fetch per share link (~0.9s each). They run
+    together, and the phones wait at most `budget` seconds (RESOLVE_BUDGET) for
+    them: a link still being looked up goes to the phones as its cleaned share
+    link. Targets this already prepared (the GUI does it once before fan-out)
+    pass straight through, so every phone keeps the SAME URL - the per-post
+    wording pool that keeps comments from repeating is keyed by it.
     """
     items = [dict(t) for t in (targets or [])]
     if not items:
         return []
-    if len(items) > 1:
-        pool = min(len(items), 8)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=pool) as ex:
-            resolved = list(ex.map(
-                lambda it: normalize_phone_url(it.get("url", "")), items))
-    else:
-        resolved = [normalize_phone_url(items[0].get("url", ""))]
+    budget = RESOLVE_BUDGET if budget is None else float(budget)
+    deadline = time.monotonic() + budget
+    futures = [None if item.get("phone_ready") else _lookup(item.get("url", ""))
+               for item in items]
+    resolved = []
+    for item, future in zip(items, futures):
+        if future is None:
+            resolved.append(item.get("url", ""))
+            continue
+        try:
+            resolved.append(future.result(timeout=max(0.0, deadline - time.monotonic())))
+        except concurrent.futures.TimeoutError:
+            clean = normalize_url(item.get("url", ""))
+            print(f"  [link] lookup still running after {budget:.0f}s - phones open "
+                  f"{clean[:80]} directly (Facebook Lite resolves it)")
+            resolved.append(clean)
+        except Exception:
+            resolved.append(normalize_url(item.get("url", "")))
     out = []
     for item, after in zip(items, resolved):
         before = item.get("url", "")
+        if item.get("phone_ready"):
+            if after:
+                out.append(item)
+            continue
         if not after:
             print(f"  [link] rejected non-Facebook or invalid URL: {before!r}")
             continue
+        kind = _target_kind(after)
+        if kind == "story":
+            # A story's only box is a PRIVATE reply (it goes to Messenger). The
+            # composer check would take it for a comment box and send a DM.
+            report_error("LINK_NOT_COMMENTABLE", url=after, severity="warning")
+            continue
+        if kind is None:
+            report_error("LINK_NOT_SINGLE_CONTENT", url=after, severity="warning")
         item["url"] = after
+        item["phone_ready"] = True
         if after != before:
             print(f"  [link] normalized for phones -> {after[:100]}")
+        print(f"  [link] {kind or 'unknown'}: comment box is "
+              f"{_COMMENT_PLACE.get(kind, 'found on the post view')}")
         out.append(item)
     return out
+
+
+# Where the run looks for the comment box, per link kind (for the run log).
+_COMMENT_PLACE = {
+    "reel": "behind the reel player's Comment button (2nd on the right rail)",
+    "video": "behind the reel player's Comment button (2nd on the right rail)",
+    "post": "at the bottom of the post, or behind its Comment button",
+    "photo": "at the bottom of the post, or behind its Comment button",
+}
 
 
 def react_all_saved_accounts(serial, url_or_targets, reaction="like",
@@ -8324,6 +9681,18 @@ def _react_all_saved_accounts(serial, targets, take_screenshots=False):
 
     wake_and_unlock(serial)
     run(["shell", "svc", "power", "stayon", "true", "usb"], serial=serial)
+    # A phone box plugged in moments ago can still be showing MIUI's
+    # "Use USB for" over everything.
+    try:
+        dismiss_system_popup(serial)
+    except Exception:
+        pass
+    # A USB-internet VPN left by a crashed or killed session keeps the phone
+    # "connected" with no way out, so no post could ever load.
+    try:
+        stop_stale_usb_vpn(serial)
+    except Exception:
+        pass
 
     results        = RunResults()
     used_accounts  = set()
@@ -8400,6 +9769,9 @@ def _react_all_saved_accounts(serial, targets, take_screenshots=False):
                     dbg(serial, "open-link", f"account {account_num} -> {gate_url}")
                     task_log(serial, "open-link",
                              f"account {account_num} -> {_short_target(gate_url)}")
+                    # Compose the comment while the post opens (no-op when
+                    # this link's comment is already pending).
+                    prefetch_comment(gate_tgt)
                     # Verified open: lands on the post itself, not the feed.
                     if open_target_post(serial, d, gate_url):
                         gate_link_no = gate_no
@@ -8440,7 +9812,11 @@ def _react_all_saved_accounts(serial, targets, take_screenshots=False):
                 results.append("safety-stop-no-link-opens")
                 break
 
-        status = wait_for_account_block(d)
+        # A verified post on screen already proves this account is logged in
+        # and not suspended, so one look is enough. Watching a healthy account
+        # for 6 s - it can never return early - was 6 s of nothing after every
+        # account's first link opened. Only a gate that opened NOTHING waits.
+        status = wait_for_account_block(d, timeout=0 if gate_link_no else 6)
         if status == "not-successful":
             results.append(status)
             report_error("ACCOUNT_LOGIN_REQUIRED", serial, account_num=account_num)
@@ -8528,6 +9904,9 @@ def _react_all_saved_accounts(serial, targets, take_screenshots=False):
                 # target post" and burned 3 cold reopens x 5 retries before the
                 # link was abandoned. _process_target sets it again, harmlessly.
                 set_current_post_url(tgt["url"])
+                # Compose this link's comment while the phone opens it; the
+                # gate link already has one pending, so this reuses it.
+                prefetch_comment(tgt)
                 if link_no != gate_link_no:
                     # the gate left ONE link on screen (0 = none opened); every
                     # other link still has to be opened here

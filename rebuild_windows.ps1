@@ -8,11 +8,12 @@ Rebuild FBVenoison, FBVenom and FBPoison, then register their executable paths.
 #>
 [CmdletBinding()]
 param(
-    [string]$Python = 'python',
+    [string]$Python,
     [string]$OutputDirectory,
     [string]$PlatformTools,
     [ValidateSet('Machine', 'User')][string]$Scope = 'Machine',
     [switch]$SkipDependencyInstall,
+    [switch]$SkipPythonUpdate,
     [switch]$SkipRegistration,
     [switch]$RegisterOnly,
     [switch]$Launch
@@ -30,7 +31,7 @@ $BuildCache = Join-Path $ProjectRoot '.build-tools'
 function Invoke-BuildPython {
     param([string[]]$PythonArguments)
     & $script:BuildPython @PythonArguments
-    if ($LASTEXITCODE -ne 0) { throw "Python command failed: $($PythonArguments -join ' ')" }
+    if ($LASTEXITCODE -ne 0) { throw "Python command failed: $($PythonArguments -join ' '). See $BuildCache for installation logs." }
 }
 
 function Find-PlatformTools {
@@ -110,25 +111,52 @@ namespace FBVenoison {
 }
 
 if (-not $RegisterOnly) {
-    # Keep build dependencies separate from the user's global Python installation.
+    . (Join-Path $ProjectRoot 'tools/windows_python.ps1')
+    New-Item -ItemType Directory -Force -Path $BuildCache | Out-Null
+    # Update/select a supported interpreter before touching pip or the venv.
+    $BasePython = Initialize-WindowsBuildPython -ExplicitPython $Python -SkipPythonUpdate:$SkipPythonUpdate -CacheDirectory (Join-Path $BuildCache 'python')
+    $BaseInfo = Get-BuildPythonInfo -Executable $BasePython
     $BuildEnvironment = Join-Path $ProjectRoot '.venv-build'
     $script:BuildPython = Join-Path $BuildEnvironment 'Scripts/python.exe'
-    if (-not (Test-Path -LiteralPath $BuildPython -PathType Leaf)) {
-        Write-Host 'Creating the local Python build environment...'
-        & $Python -m venv $BuildEnvironment
-        if ($LASTEXITCODE -ne 0) { throw 'Could not create the build environment. Check -Python points to 64-bit Windows Python.' }
+    $NeedsEnvironment = $true
+    if (Test-Path -LiteralPath $BuildPython -PathType Leaf) {
+        $ExistingInfo = Get-BuildPythonInfo -Executable $BuildPython
+        $NeedsEnvironment = -not (Test-SupportedBuildPython -Info $ExistingInfo) -or $ExistingInfo.version -ne $BaseInfo.version
     }
+    if ($NeedsEnvironment) {
+        if ($SkipDependencyInstall) { throw 'The build environment needs repair. Run again without -SkipDependencyInstall.' }
+        if (Test-Path -LiteralPath $BuildEnvironment) {
+            $Backup = Join-Path $BuildCache ('old-venv-' + [Guid]::NewGuid().ToString('N'))
+            Move-Item -LiteralPath $BuildEnvironment -Destination $Backup
+            Write-Host "Preserved the incompatible build environment at $Backup"
+        }
+        Write-Host 'Creating a fresh regular Python 3.14 x64 build environment...'
+        & $BasePython -I -m venv $BuildEnvironment
+        if ($LASTEXITCODE -ne 0) { throw 'Could not create the Python 3.14 x64 build environment.' }
+    }
+    $EnvironmentInfo = Get-BuildPythonInfo -Executable $BuildPython
+    if (-not (Test-SupportedBuildPython -Info $EnvironmentInfo)) { throw 'The build environment is not regular Python 3.14 x64. No packages were installed.' }
     if (-not $SkipDependencyInstall) {
-        Invoke-BuildPython -PythonArguments @('-m', 'pip', 'install', '-r', (Join-Path $ProjectRoot 'FBVenom/requirements-build.txt'))
+        Write-Host 'Updating pip, setuptools and wheel...'
+        Invoke-BuildPython -PythonArguments @('-I', '-m', 'pip', '--isolated', '--disable-pip-version-check', '--log', (Join-Path $BuildCache 'pip-tools.log'), 'install', '--upgrade', '--only-binary=:all:', '--index-url', 'https://pypi.org/simple', 'pip', 'setuptools', 'wheel')
+        $Wheelhouse = Join-Path $BuildCache 'wheels-cp314-win_amd64'
+        New-Item -ItemType Directory -Force -Path $Wheelhouse | Out-Null
+        $Requirements = Join-Path $ProjectRoot 'FBVenom/requirements-build.txt'
+        Write-Host 'Downloading compatible Windows wheels; no source compilation is used...'
+        Invoke-BuildPython -PythonArguments @('-I', '-m', 'pip', '--isolated', '--disable-pip-version-check', '--log', (Join-Path $BuildCache 'pip-download.log'), 'download', '--only-binary=:all:', '--index-url', 'https://pypi.org/simple', '--dest', $Wheelhouse, '-r', $Requirements)
+        Invoke-BuildPython -PythonArguments @('-I', '-m', 'pip', '--isolated', '--disable-pip-version-check', '--log', (Join-Path $BuildCache 'pip-install.log'), 'install', '--no-index', '--find-links', $Wheelhouse, '--only-binary=:all:', '--upgrade', '-r', $Requirements)
     }
-    # Python single quotes survive Windows PowerShell 5.1 native argument passing.
-    Invoke-BuildPython -PythonArguments @('-c', "import sys, struct, PyInstaller, PyQt6, uiautomator2, adbutils, PIL; assert sys.platform == 'win32' and struct.calcsize('P') == 8, '64-bit Windows Python is required'")
+    Invoke-BuildPython -PythonArguments @('-I', '-m', 'pip', '--isolated', 'check')
+    Invoke-BuildPython -PythonArguments @('-I', '-c', "import PyInstaller, PyQt6, uiautomator2, adbutils, PIL")
     $Tools = Find-PlatformTools -Requested $PlatformTools
     # A supplied tools folder is checked for genuine Windows PE files by Venom's spec.
     $env:FBVENOM_PLATFORM_TOOLS = $Tools
+    $UsbHelpers = Join-Path $BuildCache 'gnirehtet/windows'
+    Invoke-BuildPython -PythonArguments @('-I', (Join-Path $ProjectRoot 'FBVenom/tools_prepare_usb_internet.py'), '--platform', 'windows', '--out', $UsbHelpers)
+    $env:FBVENOM_GNIREHTET_DIR = $UsbHelpers
     New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
     Invoke-AppBuild -Folder (Join-Path $ProjectRoot 'FBPoison') -Spec 'fbpoison.spec' -Destination (Join-Path $OutputDirectory 'FBPoison') -Name 'FBPoison'
-    Invoke-AppBuild -Folder (Join-Path $ProjectRoot 'FBVenom') -Spec 'FBVenom.spec' -Destination (Join-Path $OutputDirectory 'FBVenom') -Name 'FBVenom'
+    Invoke-AppBuild -Folder (Join-Path $ProjectRoot 'FBVenom') -Spec (Join-Path $ProjectRoot 'FBVenom-suite.spec') -Destination (Join-Path $OutputDirectory 'FBVenom') -Name 'FBVenom'
     Invoke-AppBuild -Folder $ProjectRoot -Spec 'fbvenoison.spec' -Destination $OutputDirectory -Name 'FBVenoison'
     $SharedTools = Join-Path $OutputDirectory 'platform-tools'
     New-Item -ItemType Directory -Force -Path $SharedTools | Out-Null

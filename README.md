@@ -3,9 +3,11 @@
 FBPoison and the bundled FBVenom run in separate processes, each restricted to
 its assigned devices. FBPoison handles reactions; FBVenom includes Comments,
 Comment to Comment workspaces, and its own AI settings. The hub uses the current
-bundled Python sources, imported from `/home/kaneki/FBVenom/` (version 1.1.1).
-The imported app includes the new Venom interface, live-link support,
-diagnostics, and its updater. Explicit executable overrides take priority; packaged
+bundled Python sources, imported unchanged from
+[`kaneki654/FBVenom`](https://github.com/kaneki654/FBVenom) (version 1.1.12,
+commit `afbfabf0e29ac6d267a3c6e914689a02ac2cc73e`).
+The imported app includes the current Venom interface, LAN/server backup, USB
+internet, phone-box fixes, diagnostics, and its updater. Explicit executable overrides take priority; packaged
 launches otherwise prefer apps shipped beside the hub over legacy home folders.
 
 ![Dashboard with a sample fleet](docs/dashboard-preview.png)
@@ -122,16 +124,21 @@ the updater's settings/download location.
 
 ## Rebuild and register on Windows
 
-Run this in PowerShell with 64-bit Windows Python installed (Python 3.12 is
-supported by the bundled build requirements):
+Run this in Windows PowerShell or PowerShell 7:
 
 ```powershell
 .\rebuild_windows.ps1 -Launch
 ```
 
-The script creates an isolated `.venv-build` environment, installs the pinned
-build dependencies, finds Windows Android platform-tools (or downloads them
-from Google), and rebuilds **FBPoison**, **FBVenom**, and **FBVenoison** into
+The script **installs or updates regular Python 3.14 x64 first**, using WinGet
+or a signature-verified installer from python.org. It selects that interpreter
+without relying on a stale PATH, repairs an incompatible `.venv-build`, upgrades
+pip/setuptools/wheel, downloads Windows wheels, and installs those wheels
+without compiling packages from source. Python 3.15, 32-bit, ARM64 and
+free-threaded interpreters are rejected before package installation.
+
+It finds Windows Android platform-tools (or downloads them from Google),
+prepares upstream's verified Gnirehtet USB-internet helpers, and rebuilds **FBPoison**, **FBVenom**, and **FBVenoison** into
 `release/FBVenoison/`. It packages shared ADB tools with the suite and checks
 that all three EXEs and Venom's matching device bridge exist before registering
 paths. Close any running app windows before rebuilding their executables.
@@ -160,7 +167,7 @@ the longer executable variable names, with bundled-file fallback.
 .\rebuild_windows.ps1 -Scope User -Launch
 
 # Choose Python, tools, and an output folder.
-.\rebuild_windows.ps1 -Python 'C:\Python312\python.exe' -PlatformTools 'C:\Android\platform-tools' -OutputDirectory 'C:\Apps\FBVenoison'
+.\rebuild_windows.ps1 -Python 'C:\Python314\python.exe' -PlatformTools 'C:\Android\platform-tools' -OutputDirectory 'C:\Apps\FBVenoison'
 
 # Register an existing completed build without rebuilding.
 .\rebuild_windows.ps1 -RegisterOnly -OutputDirectory 'C:\Apps\FBVenoison'
@@ -169,19 +176,29 @@ the longer executable variable names, with bundled-file fallback.
 .\rebuild_windows.ps1 -SkipRegistration
 ```
 
-`-SkipDependencyInstall` reuses the local build environment without running
-pip again. `build_windows.ps1` remains a compatible entry point and forwards
+`-SkipPythonUpdate` uses an already-installed supported interpreter (useful in
+CI). `-SkipDependencyInstall` reuses a valid build environment without installing
+packages again. Leave both off when repairing a failed build. Pip logs are saved
+under `.build-tools/`. `build_windows.ps1` remains a compatible entry point and forwards
 the same options. Existing private settings in the output directory are kept;
 only empty example configurations are copied for a fresh installation.
 
 A managed FBVenom build emits `FBVenom.suite-bridge.json` beside its EXE; keep
-this matching file with the binary. The standalone upstream 1.1.1 EXE does
+this matching file with the binary. The standalone upstream 1.1.12 EXE does
 not include that bridge, so rebuild before using it through a frozen hub.
 
-The bridge applies the hub's device list, shared ADB path, and existing unlock.
-While managed by the hub, FBVenom's own binary replacement actions direct you
-to update the suite, so an upstream standalone update cannot remove that
-integration. Its standalone updater retains its normal behavior.
+All 57 imported files are recorded by SHA-256 in `docs/FBVenom-import.json`.
+Upstream source, tests, spec and updater stay byte-for-byte unchanged. The hub's
+`venom_bridge.py` and `integration/venom_runtime_hook.py` apply device routing,
+shared ADB and the existing hub unlock at launch. USB internet discovery is also
+limited to Venom's assigned devices. Rebalance, manual device moves and target
+counts remain in FBVenoison; Venom keeps its upstream functions and interface.
+
+`FBVenom-suite.spec` delegates to the unchanged upstream spec and adds the
+external runtime hook and a hash-bound capability marker. Upstream's own
+update/downgrade functions remain available. Installing a standalone upstream
+EXE replaces the managed build, so rebuild the suite before using that EXE for
+assigned-device sessions through the hub.
 
 The hub's PyInstaller spec embeds the generated assets and updater. Child apps
 remain external processes under `FBPoison/fbpoison.exe` and

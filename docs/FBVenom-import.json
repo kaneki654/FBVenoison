@@ -1,9 +1,10 @@
 {
-  "source": "/home/kaneki/FBVenom",
-  "destination": "/home/kaneki/FBVenoison/FBVenoison/FBVenom",
-  "source_commit": "ad9aca2683d0dad3b3023b7aa7409132d62b9706",
-  "version": "1.1.1",
-  "backup": "/home/kaneki/FBVenoison/FBVenoison/.backups/FBVenom-before-import-20261116-054714",
+  "source": "https://github.com/kaneki654/FBVenom.git",
+  "source_commit": "afbfabf0e29ac6d267a3c6e914689a02ac2cc73e",
+  "version": "1.1.12",
+  "backup": "/home/kaneki/FBVenoison/FBVenoison/.backups/FBVenom-before-1.1.12-20261121-135311",
+  "upstream_code_modified": false,
+  "integration": "External venom_bridge.py and runtime hook; upstream files remain byte-identical.",
   "preserved_local_state": [
     "venom_ai.json",
     "venom_accounts.json",
@@ -13,254 +14,288 @@
   "files": [
     {
       "path": ".github/workflows/build-windows.yml",
-      "sha256": "14b7adb14654e1e4476fceca5e1638cc967edc3b7e1b725e4a9a7cf1e0efc664",
-      "changed": true,
-      "integrated_sha256": "a91a3f33a0f20bac984654093df1403143221b88e2ed397a361e7e3e74f5c356"
+      "sha256": "03e4074106a970714d57ac907219591b44713d35f39e7c81020fd290bce5e011",
+      "optional_runtime_artifact": false
+    },
+    {
+      "path": ".github/workflows/publish-update.yml",
+      "sha256": "3530f5399afefdb41c6f90030791aa332fad1ed02b60637ced02d6a058ec522b",
+      "optional_runtime_artifact": false
     },
     {
       "path": ".gitignore",
-      "sha256": "32b2849dce39cdc8b1815032b2fecafdb9f2ec173dae617ade3352a2fc6c2163",
-      "changed": true,
-      "integrated_sha256": "32b2849dce39cdc8b1815032b2fecafdb9f2ec173dae617ade3352a2fc6c2163"
+      "sha256": "67e41921c9b0f9b48a8ef2480b21cb5745381e4b5c6967e7fd610a24f1f84d01",
+      "optional_runtime_artifact": false
     },
     {
       "path": "FBVenom.spec",
-      "sha256": "4c6ac288c21376474c647d4ccd037e29836fc53bb7d8baac65a2555143c60ef6",
-      "changed": true,
-      "integrated_sha256": "4aad097889bbca7035a067131d64447f3da83d424264e53752dc1898050c70a2"
+      "sha256": "6d0b0680ff9ed8974083f5559f8cd732a92e1b6be95f52baaa48b80677382552",
+      "optional_runtime_artifact": false
     },
     {
       "path": "README.md",
-      "sha256": "a3baa08f506b968ab7358a2e76117ec62d5237e3c8f42cbabb0035a27e538a71",
-      "changed": true,
-      "integrated_sha256": "a3baa08f506b968ab7358a2e76117ec62d5237e3c8f42cbabb0035a27e538a71"
+      "sha256": "5f74522d25581110567cb8f6418b7c3ec3df58ab15235e51dba499d370a933d2",
+      "optional_runtime_artifact": false
     },
     {
       "path": "aiconfig.py",
-      "sha256": "968ad9bcd6dec60606c1841d32587aaeffff6ff207db5c1e14a9a2f175f88a25",
-      "changed": true,
-      "integrated_sha256": "968ad9bcd6dec60606c1841d32587aaeffff6ff207db5c1e14a9a2f175f88a25"
+      "sha256": "8237683ec0c0a34d1fd370e14e65475dca17076d4fc77c75ec303db6ca996bdb",
+      "optional_runtime_artifact": false
     },
     {
       "path": "assets/branding/SOURCES.md",
       "sha256": "599ab3b8387827f82abafa7f877ab77ac812838f816fab29fbbcf42b0d1e0d91",
-      "changed": false,
-      "integrated_sha256": "599ab3b8387827f82abafa7f877ab77ac812838f816fab29fbbcf42b0d1e0d91"
+      "optional_runtime_artifact": false
     },
     {
       "path": "assets/branding/facebook.svg",
       "sha256": "82bc3244a4458deb1fe7b096b0dc65c7f1f6a0d5627a1733a0fdcc9430612d46",
-      "changed": false,
-      "integrated_sha256": "82bc3244a4458deb1fe7b096b0dc65c7f1f6a0d5627a1733a0fdcc9430612d46"
+      "optional_runtime_artifact": false
     },
     {
       "path": "assets/branding/venom-head.png",
       "sha256": "3a3eb468f5f5a03f8946d72206989613e7e93e79fac415140ca3bf268d6d1f94",
-      "changed": false,
-      "integrated_sha256": "3a3eb468f5f5a03f8946d72206989613e7e93e79fac415140ca3bf268d6d1f94"
+      "optional_runtime_artifact": false
     },
     {
       "path": "auth.py",
       "sha256": "c0785e8bba1acefb9c4660583567030eb0efb62cf868d88956c22276be0524c2",
-      "changed": false,
-      "integrated_sha256": "c0785e8bba1acefb9c4660583567030eb0efb62cf868d88956c22276be0524c2"
+      "optional_runtime_artifact": false
     },
     {
       "path": "core.py",
-      "sha256": "1850dc09409d6e292613df79c7f1a9f4b2343e76d86c4f4485acdabda445ee67",
-      "changed": true,
-      "integrated_sha256": "1850dc09409d6e292613df79c7f1a9f4b2343e76d86c4f4485acdabda445ee67"
+      "sha256": "9738371f38f82fac7cc730fd2ffdc92970f002a6490bd67c1bc0c82dc31f3379",
+      "optional_runtime_artifact": false
     },
     {
       "path": "dist/FBVenom.build.json",
-      "sha256": "e8f4f9ae111599b1896d67e537291343711ffac229d7bb495769b2469a97a171",
-      "changed": true,
-      "integrated_sha256": "e8f4f9ae111599b1896d67e537291343711ffac229d7bb495769b2469a97a171"
+      "sha256": "e134812e8aac10c941fc36749ae20cfd2e0eca33575449a6f9912f01f889c677",
+      "optional_runtime_artifact": true
     },
     {
       "path": "dist/FBVenom.exe",
-      "sha256": "af34effdae379cf3c1e3859da93004c7a61db6ae325444d0236b5a175d8bb50d",
-      "changed": true,
-      "integrated_sha256": "af34effdae379cf3c1e3859da93004c7a61db6ae325444d0236b5a175d8bb50d"
+      "sha256": "216d6344ce9ff38d633470218544b8ae7f7ed7dd2e3ccfc3935169a315b0e20c",
+      "optional_runtime_artifact": true
     },
     {
       "path": "dist/FBVenom.sha256",
-      "sha256": "ddf474b7f5cc49c118cd7ffea2ebc33ee47ffa4efe23be53923ce110a51e0546",
-      "changed": true,
-      "integrated_sha256": "ddf474b7f5cc49c118cd7ffea2ebc33ee47ffa4efe23be53923ce110a51e0546"
+      "sha256": "36fb535b505834a0f77ff8eb63a89932716f448a2ff8c4981b5d35260ddaf5e7",
+      "optional_runtime_artifact": true
     },
     {
       "path": "dist/manifest.json",
-      "sha256": "2b6b9ed4d3a847c547d78a51be693b08439d72ad859f194ba48bc1079d255a47",
-      "changed": true,
-      "integrated_sha256": "2b6b9ed4d3a847c547d78a51be693b08439d72ad859f194ba48bc1079d255a47"
+      "sha256": "81e598cb004b4baa4437e4996d147b416c56cb8fb74654c109ca9e1f1a1577c8",
+      "optional_runtime_artifact": true
     },
     {
       "path": "fbvenom.py",
-      "sha256": "b6a7f2b44d4bf99ef485f6f11a6eda6f29d2291cca185eaf984225360ceb5451",
-      "changed": true,
-      "integrated_sha256": "86536fef05f9464f2c6472c2d2904d2a7dd586faf45a9e333ff1a303dfdcef83"
+      "sha256": "303e178cb9a19421b2ed19bc6dc76273c1ee75b3b459a2c8d7ad5eedeb27ef5a",
+      "optional_runtime_artifact": false
     },
     {
       "path": "gui.py",
-      "sha256": "eb062487997dfb59a973e810beb7462cac25992e23206c431275fcc58278fc45",
-      "changed": true,
-      "integrated_sha256": "eb062487997dfb59a973e810beb7462cac25992e23206c431275fcc58278fc45"
+      "sha256": "84956d58c0bd504d5148d557f94b0ba6d86abda4a6ed040b58095db4377bf45a",
+      "optional_runtime_artifact": false
     },
     {
       "path": "icon.ico",
       "sha256": "cbd41191b2cfa795e173fa0b400054dddaa30c60c011a84d75b6f3e91a9eb3b8",
-      "changed": false,
-      "integrated_sha256": "cbd41191b2cfa795e173fa0b400054dddaa30c60c011a84d75b6f3e91a9eb3b8"
+      "optional_runtime_artifact": false
     },
     {
       "path": "icon.png",
       "sha256": "b32f68e34cd3aaa540a798ef2a3b75d728b2128d6d867dc9e06d689343b2196c",
-      "changed": false,
-      "integrated_sha256": "b32f68e34cd3aaa540a798ef2a3b75d728b2128d6d867dc9e06d689343b2196c"
+      "optional_runtime_artifact": false
     },
     {
       "path": "icon.svg",
       "sha256": "e73d05cbaff2c6b379670a26e3f525728a4d32750a52b3123354bbe712b35a6d",
-      "changed": false,
-      "integrated_sha256": "e73d05cbaff2c6b379670a26e3f525728a4d32750a52b3123354bbe712b35a6d"
+      "optional_runtime_artifact": false
     },
     {
       "path": "icon_nobg.png",
       "sha256": "0011d7e5892482c1779b984fbeefc3c768e19cc861876293e1605fdce915f37a",
-      "changed": false,
-      "integrated_sha256": "0011d7e5892482c1779b984fbeefc3c768e19cc861876293e1605fdce915f37a"
+      "optional_runtime_artifact": false
     },
     {
       "path": "requirements-build.txt",
       "sha256": "354efabd57cedab1e79453c3f75c3f48c2f6a5b67467622980db8e9398e7f64a",
-      "changed": true,
-      "integrated_sha256": "354efabd57cedab1e79453c3f75c3f48c2f6a5b67467622980db8e9398e7f64a"
+      "optional_runtime_artifact": false
+    },
+    {
+      "path": "test_ai_delivery.py",
+      "sha256": "22f82e7e46ea705f1ce51f5365a3588f12846d6b569b1493f427380169767a03",
+      "optional_runtime_artifact": false
     },
     {
       "path": "test_build_check.py",
-      "sha256": "ef550ecb146f2ad71d8cf02972920707fe321ff7dd88582da27bb206d1eaf29e",
-      "changed": true,
-      "integrated_sha256": "ef550ecb146f2ad71d8cf02972920707fe321ff7dd88582da27bb206d1eaf29e"
+      "sha256": "5ad37a71e4c2c62fa95b868598f4f9fd9f03005bf6754e28467801ca5d93cdd2",
+      "optional_runtime_artifact": false
     },
     {
       "path": "test_build_spec.py",
-      "sha256": "ff9ac8c428190a3883eb7f57b7d480475d549a04ba32ff2520866de7113fb44a",
-      "changed": true,
-      "integrated_sha256": "89b3bfccec98398c42e9471ac618b444056c405f1d423cc6c008fe153c98d7ef"
+      "sha256": "36cca0d5b90f9db69f7dda0dde6c373c291e78f498218b81fce907e5ab188a84",
+      "optional_runtime_artifact": false
     },
     {
       "path": "test_comment_diagnostics.py",
-      "sha256": "0509d0791a93324f68f328dc61867b35a522aea936aee7038356d393a27481c5",
-      "changed": true,
-      "integrated_sha256": "0509d0791a93324f68f328dc61867b35a522aea936aee7038356d393a27481c5"
+      "sha256": "5ef76e9bfcb3ba5307b19cddf1d2250757ed85ea6fe6f562a45951bf4ea11b1e",
+      "optional_runtime_artifact": false
+    },
+    {
+      "path": "test_comment_send.py",
+      "sha256": "47b8f6e530bfaae9ab0dcf28cca6e174be44b75fdb46f1295de94b222056aa3c",
+      "optional_runtime_artifact": false
     },
     {
       "path": "test_comment_variety.py",
       "sha256": "bf0eb4d60939e0ff2301e624b609d112a4222414509c9440d5e6192e42641663",
-      "changed": true,
-      "integrated_sha256": "bf0eb4d60939e0ff2301e624b609d112a4222414509c9440d5e6192e42641663"
+      "optional_runtime_artifact": false
+    },
+    {
+      "path": "test_core_server_modes.py",
+      "sha256": "a40bd342b136dd5c3648fc8a120fb379f5e865d37072320209b5bf5abd3ad6ca",
+      "optional_runtime_artifact": false
     },
     {
       "path": "test_diagnostics.py",
       "sha256": "878cfbe54aadc98af95216866b085418127fc3ba912b15273836e96414fa22b1",
-      "changed": true,
-      "integrated_sha256": "878cfbe54aadc98af95216866b085418127fc3ba912b15273836e96414fa22b1"
+      "optional_runtime_artifact": false
     },
     {
       "path": "test_gui_diagnostics.py",
       "sha256": "0b813dd7709b02a4d5d831c8326329c87988897de949055d029fdd5db7a29534",
-      "changed": true,
-      "integrated_sha256": "0b813dd7709b02a4d5d831c8326329c87988897de949055d029fdd5db7a29534"
+      "optional_runtime_artifact": false
+    },
+    {
+      "path": "test_gui_responsive.py",
+      "sha256": "3b6ea9717c728360b9ff28c4ea38e9fbeafe4e4d03982f622d485b75a22266f9",
+      "optional_runtime_artifact": false
+    },
+    {
+      "path": "test_gui_server_modes.py",
+      "sha256": "2b7439f1cfbafdafbcbecef5d9f836c6209a6ed7ed0b429a74e0d89f4bc1abcf",
+      "optional_runtime_artifact": false
+    },
+    {
+      "path": "test_gui_updater.py",
+      "sha256": "7309b25681b22471e03b4bd3c0f051e6fc7da54467306a362e01cd3c443b798c",
+      "optional_runtime_artifact": false
+    },
+    {
+      "path": "test_gui_usb_internet.py",
+      "sha256": "7fea45d8fb6b7996d52a601455751858161a3c118feb6db71dd0d8f5b984cbf3",
+      "optional_runtime_artifact": false
     },
     {
       "path": "test_gui_workspaces.py",
       "sha256": "dd11bb177ffd2592e3b16614b49cea1ee16e1a373ef25edd479cb9b3ba5a7ba0",
-      "changed": false,
-      "integrated_sha256": "dd11bb177ffd2592e3b16614b49cea1ee16e1a373ef25edd479cb9b3ba5a7ba0"
+      "optional_runtime_artifact": false
     },
     {
       "path": "test_live_counting.py",
       "sha256": "5b9840eafe350deb9b43cde1ecd9122e3044a09218a958ecea82240c23422760",
-      "changed": false,
-      "integrated_sha256": "5b9840eafe350deb9b43cde1ecd9122e3044a09218a958ecea82240c23422760"
+      "optional_runtime_artifact": false
+    },
+    {
+      "path": "test_open_post.py",
+      "sha256": "fe1139e6ac412c11c572d9ff120d24fe3764aa714d1feeb31731174bcd017e93",
+      "optional_runtime_artifact": false
+    },
+    {
+      "path": "test_phone_boxes.py",
+      "sha256": "4d6d034cb780894b4358b02535b733102e9f7cc446bb511681ab3b26319f30a5",
+      "optional_runtime_artifact": false
+    },
+    {
+      "path": "test_publish_update.py",
+      "sha256": "f9fcd5cf07d3395db6ee9a4cdc5cd87899d8fb60c87ec420cdb9eaebb8b78e81",
+      "optional_runtime_artifact": false
+    },
+    {
+      "path": "test_reel_comments.py",
+      "sha256": "aabf5e84ebcd672352073af92d55278b5ce9f4f8b4c5f4a24ad40a18c6df385c",
+      "optional_runtime_artifact": false
+    },
+    {
+      "path": "test_server_modes.py",
+      "sha256": "8d78640700e04af475e6b850f50ace1ef0347a04be00f7680ac8cecffe6b4788",
+      "optional_runtime_artifact": false
     },
     {
       "path": "test_updater.py",
-      "sha256": "3efedccb762c3442029900ebf6bde1f1e34a77ff49facd89b645547968e01fa2",
-      "changed": true,
-      "integrated_sha256": "3efedccb762c3442029900ebf6bde1f1e34a77ff49facd89b645547968e01fa2"
+      "sha256": "ca0916e370c5002a2d04b16abbd643cb9740a4e0465ff683b530626db9ba10b2",
+      "optional_runtime_artifact": false
     },
     {
       "path": "test_urls.py",
-      "sha256": "48b9ecae22a6fa6f31e357bf991b2b36e8a379c5734195120a940a8f8a2b15d6",
-      "changed": true,
-      "integrated_sha256": "48b9ecae22a6fa6f31e357bf991b2b36e8a379c5734195120a940a8f8a2b15d6"
+      "sha256": "cc4d5a0dde5423ea210a55af339b2dc4aaf33f9674d2459eb991bce1bdb6bfda",
+      "optional_runtime_artifact": false
+    },
+    {
+      "path": "test_usb_internet.py",
+      "sha256": "e62333c18fb75324c0a07401d6ae5c41b11dc6638e1fe75c7dcf565b5fd90db7",
+      "optional_runtime_artifact": false
     },
     {
       "path": "test_windows_build_validation.py",
       "sha256": "07d99b752161d5ceaa028120aec06444686bd69d3e2ecf52d380cabcecc939b5",
-      "changed": true,
-      "integrated_sha256": "07d99b752161d5ceaa028120aec06444686bd69d3e2ecf52d380cabcecc939b5"
+      "optional_runtime_artifact": false
     },
     {
       "path": "test_workspaces.py",
       "sha256": "b34eaf57cfe51e501577701f09ea45b75a0bffe0d07f801639d61279c8e14cd0",
-      "changed": false,
-      "integrated_sha256": "b34eaf57cfe51e501577701f09ea45b75a0bffe0d07f801639d61279c8e14cd0"
+      "optional_runtime_artifact": false
+    },
+    {
+      "path": "tools_prepare_usb_internet.py",
+      "sha256": "700895caa223a42f4e38504068a81dc51b7d0c1bb4d5e839d77b3c8e4eb7acc7",
+      "optional_runtime_artifact": false
     },
     {
       "path": "tools_publish_update.py",
-      "sha256": "43b5a4abd3464dab145c8dd21c49e3c7fa2b77a28b3ea7d8cbd6acd6867514ef",
-      "changed": true,
-      "integrated_sha256": "43b5a4abd3464dab145c8dd21c49e3c7fa2b77a28b3ea7d8cbd6acd6867514ef"
+      "sha256": "04310e26242462b5ac5eee400d34341f7d2df68b412ea2dc442ab17ec8cb7b65",
+      "optional_runtime_artifact": false
     },
     {
       "path": "tools_strip_icon_bg.py",
       "sha256": "2d83f07aa903ea6e5f9c7ee1aa4ea73d7c4bdbc7d222176cc70c47264dbe0e3c",
-      "changed": false,
-      "integrated_sha256": "2d83f07aa903ea6e5f9c7ee1aa4ea73d7c4bdbc7d222176cc70c47264dbe0e3c"
+      "optional_runtime_artifact": false
     },
     {
       "path": "tools_validate_windows_build.py",
-      "sha256": "3da871e7d86e99e5e687c1826dc1e2736a9c165ca79360829b18c87ad48c1c05",
-      "changed": true,
-      "integrated_sha256": "3da871e7d86e99e5e687c1826dc1e2736a9c165ca79360829b18c87ad48c1c05"
+      "sha256": "d9750790bf220a2a1ca62eb24eccb9dba2716f7a7c7e669360314f9a556d079b",
+      "optional_runtime_artifact": false
     },
     {
       "path": "updater.py",
-      "sha256": "b2c041d08710f89d25b023074d1b4e99a13f514d0c3ab1caac800bc536aebeab",
-      "changed": true,
-      "integrated_sha256": "256b78d9d84ca74f5d4d6ea18f78c6ff6ee65252d56f404b1e0147a9f312a31f"
+      "sha256": "c10245c120f333195d3789cb5a1da7afaee4fcb913854a95f8c2445d8b7c3ab1",
+      "optional_runtime_artifact": false
+    },
+    {
+      "path": "usb_internet.py",
+      "sha256": "f104b327f70f57eb6d93e27d2efef8dcbd9d8e8dcc0b007ec10c4b2a6a3322a1",
+      "optional_runtime_artifact": false
+    },
+    {
+      "path": "usb_network.py",
+      "sha256": "43cb89341c269baa232bb33f7660cc34087fdb3ecf2c4e88551764b61d8723cd",
+      "optional_runtime_artifact": false
     },
     {
       "path": "venom_ai.example.json",
       "sha256": "f48877f7ae01cf089ca858a019f1c961db91153686be193cadedb5858e091bf8",
-      "changed": true,
-      "integrated_sha256": "f48877f7ae01cf089ca858a019f1c961db91153686be193cadedb5858e091bf8"
+      "optional_runtime_artifact": false
     },
     {
       "path": "version.py",
-      "sha256": "5e514eb6f47572a1e19a7a8856ced1568eeba8b9025717f6656376ddb8cb4820",
-      "changed": true,
-      "integrated_sha256": "5e514eb6f47572a1e19a7a8856ced1568eeba8b9025717f6656376ddb8cb4820"
+      "sha256": "0cd567fbfb22b76c07a40b252904e03595f32ec40747621ee2c2d7bf336133f4",
+      "optional_runtime_artifact": false
     },
     {
       "path": "workspaces.py",
       "sha256": "5ff8ddc74136d62bf756bb991bbf4f3fd95263698ec53e005b1bea5f1d70b03d",
-      "changed": false,
-      "integrated_sha256": "5ff8ddc74136d62bf756bb991bbf4f3fd95263698ec53e005b1bea5f1d70b03d"
+      "optional_runtime_artifact": false
     }
-  ],
-  "integration_changes": [
-    ".github/workflows/build-windows.yml",
-    "FBVenom.spec",
-    "fbvenom.py",
-    "test_build_spec.py",
-    "updater.py"
-  ],
-  "integration_additions": [
-    "suite_bridge.py"
-  ],
-  "verified_at": "2026-11-16T05:51:12.560825+00:00"
+  ]
 }

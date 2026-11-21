@@ -16,6 +16,7 @@ venv/
 
 # Private settings and runtime data
 /venom_ai.json
+/.venom-ai-*.tmp
 /venom_workspaces.json
 /venom_accounts.json
 /screenshots/
@@ -30,3 +31,7 @@ venv/
 *.bak
 *.bak.*
 *~
+
+# USB internet helpers are fetched and verified at build time
+/gnirehtet/
+/logs/
